@@ -79,26 +79,27 @@ Selective version — yolo for everything except exploit execution:
 ```typescript
 // .opencode/plugins/exploit-gate.ts
 //
-// VERIFIED: permission.ask hook signature is (permission, output) => void
-// VERIFIED: output.status accepts 'allow' | 'deny'
-// VERIFIED: permission.type gives the tool/permission type (e.g. 'bash', 'edit')
-// NEEDS VALIDATION: how to inspect the actual bash command being run.
-//   Options to try at implementation time:
-//     - permission.input?.command
-//     - permission.description
-//     - permission.metadata?.command
-//   If none work, match on permission.type === 'bash' and deny all bash
-//   in HITL mode (coarser but guaranteed to work).
+// VERIFIED API (from packages/plugin/src/index.ts + packages/opencode/src/permission/index.ts):
+//   permission.ask: (permission, output) => void
+//     permission (Permission.Info): {
+//       id, type, pattern?, sessionID, messageID, callID?,
+//       title: string,           ← human-readable description of what's being requested
+//       metadata: Record<string, unknown>,  ← tool-specific data (e.g. bash command)
+//       time: { created: number }
+//     }
+//     output: { status: 'ask' | 'allow' | 'deny' }
 
-export const ExploitGate: Plugin = async (ctx) => {
+import type { Plugin } from "@opencode-ai/plugin"
+
+export const ExploitGate: Plugin = async () => {
     return {
         'permission.ask': async (permission, output) => {
             if (process.env.BELLUM_HITL === "true" && permission.type === "bash") {
-                // In HITL mode, inspect the command for exploit tool invocations.
-                // Cast to string defensively — exact field TBD during implementation.
+                // permission.title contains the human-readable description
+                // permission.metadata may contain the command details
+                const title = permission.title ?? "";
                 const cmd = String(
-                    (permission as any).input?.command ??
-                    (permission as any).description ?? ""
+                    (permission.metadata as any)?.command ?? title
                 );
                 const exploitTools = ["ble_write", "subghz_replay", "ir_replay", "badusb"];
                 if (exploitTools.some(t => cmd.includes(t))) {
@@ -216,7 +217,7 @@ ORCHESTRATOR (TypeScript process, no LLM — calls opencode -p for each phase)
 │   Within each phase, the LLM can spawn Task subagents (depth 1).
 │   This avoids all three upstream subagent bugs.
 │
-├─── opencode -p --agent bellum-recon [prompt]          ← DEPTH 0 (fresh process)
+├─── opencode -p [prompt]  (default_agent=bellum-recon)          ← DEPTH 0 (fresh process)
 │   │
 │   │   bellum-recon: fast model (kimi/k2.5), yolo, has Task tool
 │   │   Reads findings/target.json → scans → writes findings/surfaces.json
@@ -245,7 +246,7 @@ ORCHESTRATOR (TypeScript process, no LLM — calls opencode -p for each phase)
 │
 │   [ORCHESTRATOR reads findings/surfaces.json, validates gate]
 │
-├─── opencode -p --agent bellum-research [prompt]       ← DEPTH 0 (fresh process)
+├─── opencode -p [prompt]  (default_agent=bellum-research)       ← DEPTH 0 (fresh process)
 │   │
 │   │   bellum-research: strong model (claude-sonnet), yolo, has Task + WebSearch
 │   │   Reads surfaces.json → researches → writes findings/intel.json
@@ -275,7 +276,7 @@ ORCHESTRATOR (TypeScript process, no LLM — calls opencode -p for each phase)
 │
 │   [ORCHESTRATOR reads findings/intel.json, validates gate]
 │
-├─── opencode -p --agent bellum-enumerate [prompt]      ← DEPTH 0 (fresh process)
+├─── opencode -p [prompt]  (default_agent=bellum-enumerate)      ← DEPTH 0 (fresh process)
 │   │
 │   │   bellum-enumerate: strong model, yolo, NO Task tool (sequential only)
 │   │   Reads surfaces.json + intel.json → probes target → writes findings/vectors.json
@@ -299,7 +300,7 @@ ORCHESTRATOR (TypeScript process, no LLM — calls opencode -p for each phase)
 │
 ├─── FOR vector IN vectors.vector_priority:             ← DETERMINISTIC (orchestrator TS)
 │   │
-│   └── opencode -p --agent bellum-exploit [prompt]     ← DEPTH 0 (fresh process)
+│   └── opencode -p [prompt]  (default_agent=bellum-exploit)     ← DEPTH 0 (fresh process)
 │       │
 │       │   bellum-exploit: unaligned model (minimax/m2.5), yolo (or HITL via plugin)
 │       │   Reads vectors.json + intel.json → crafts + executes exploit
@@ -321,7 +322,7 @@ ORCHESTRATOR (TypeScript process, no LLM — calls opencode -p for each phase)
 │     success === false? → continue to next vector (V2: REST API)
 │     all vectors failed? → proceed to report anyway
 │
-└─── opencode -p --agent bellum-report [prompt]         ← DEPTH 0 (fresh process)
+└─── opencode -p [prompt]  (default_agent=bellum-report)         ← DEPTH 0 (fresh process)
     │
     │   bellum-report: fast model (kimi/k2.5), yolo, read-only (no Bash, no hardware)
     │   Reads ALL findings/* → writes reports/bellum-{id}.md
@@ -597,6 +598,24 @@ interface BellumConfig {
     hitl: boolean;            // default false (full yolo)
 }
 
+// Agent selection strategy:
+// OpenCode has NO --agent flag. Verified: the only CLI flags for -p mode are
+// -f, -q, --verbose, --allowedTools, --excludedTools, --cwd.
+//
+// Two approaches to select an agent per phase:
+//   1. Swap `default_agent` in opencode.json before each phase invocation.
+//      The `default_agent` config key controls which primary agent handles -p prompts.
+//   2. Use `@agent-name` mention in the prompt (works for subagents, UNVERIFIED for -p).
+//
+// We use approach 1: write a phase-specific opencode.json before each invocation.
+
+async function setDefaultAgent(workspace: string, agentName: string) {
+    const configPath = join(workspace, "opencode.json");
+    const config = await readJson(configPath);
+    config.default_agent = agentName;
+    await writeJson(configPath, config);
+}
+
 // Each phase = a separate `opencode -p` process invocation.
 // -p mode auto-approves all permissions (yolo).
 // The ralph loop is implemented by re-invoking until gate passes or max iterations hit.
@@ -610,16 +629,16 @@ async function runPhase(opts: {
 }): Promise<boolean> {
     let consecutiveErrors = 0;
 
+    // Set this phase's agent as the default before invoking
+    await setDefaultAgent(opts.workspace, opts.agent);
+
     for (let i = 0; i < opts.maxIter; i++) {
         const envStr = Object.entries(opts.env ?? {})
             .map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" ");
 
-        // NOTE: --agent flag needs verification against actual OpenCode CLI.
-        // Fallback: prefix prompt with "@bellum-recon" mention syntax.
-        // See "Agent Invocation" section below for alternatives.
         try {
             await run(
-                `${envStr} opencode -p ${JSON.stringify(opts.prompt)} --agent ${opts.agent} -q`,
+                `${envStr} opencode -p ${JSON.stringify(opts.prompt)} -q`,
                 { cwd: opts.workspace, timeout: 300_000 } // 5 min timeout per iteration
             );
             consecutiveErrors = 0; // reset on success
@@ -800,25 +819,23 @@ Recovery is NOT a state. It's **inline plugin hooks** that fire when tools fail.
 ```typescript
 // .opencode/plugins/hardware-recovery.ts
 //
-// HOOK API NOTE: tool.execute.before and tool.execute.after are documented hooks.
-// Exact ctx shape needs validation against OpenCode source at implementation time.
-// The field names below (ctx.tool.name, ctx.result.stderr, etc.) are best guesses
-// from the plugin development guide. Defensively access with optional chaining.
+// VERIFIED API (from packages/plugin/src/index.ts):
+//   tool.execute.after: (input, output) => void
+//     input: { tool: string, sessionID: string, callID: string, args: any }
+//     output: { title: string, output: string, metadata: any }
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { execSync } from "child_process";
-import { writeFileSync, existsSync } from "fs";
+import { writeFileSync } from "fs";
 
-export const HardwareRecovery: Plugin = async (ctx) => {
+export const HardwareRecovery: Plugin = async () => {
     return {
-        'tool.execute.after': async (toolCall, output) => {
-            // Defensively extract error text — exact field names TBD
-            const stderr = String(
-                (output as any)?.stderr ?? (output as any)?.error ?? ""
-            );
+        'tool.execute.after': async (input, output) => {
+            // tool.execute.after gives us output.output (string) — contains both stdout and stderr
+            const text = output.output ?? "";
 
             // Serial disconnection — Flipper USB lost
-            if (stderr.includes("SerialException") || stderr.includes("could not open port")) {
+            if (text.includes("SerialException") || text.includes("could not open port")) {
                 console.log("[RECOVERY] Flipper disconnected. Attempting reconnection...");
                 for (let attempt = 0; attempt < 3; attempt++) {
                     try {
@@ -832,12 +849,15 @@ export const HardwareRecovery: Plugin = async (ctx) => {
                 // All retries failed — write status so agent skips Flipper tools
                 writeFileSync("findings/hardware_status.json",
                     JSON.stringify({ flipper: "disconnected", timestamp: Date.now() }));
+                // Modify the output the agent sees to include recovery status
+                output.output += "\n[RECOVERY] Flipper disconnected. Hardware status updated.";
             }
 
             // BLE adapter failure — reset hci0
-            if (stderr.includes("BleakError") || stderr.includes("ConnectionError")) {
+            if (text.includes("BleakError") || text.includes("ConnectionError")) {
                 console.log("[RECOVERY] BLE connection failed. Resetting adapter...");
                 try { execSync("sudo hciconfig hci0 reset"); } catch { /* best effort */ }
+                output.output += "\n[RECOVERY] BLE adapter reset. Retry the command.";
             }
         },
     };
@@ -847,38 +867,37 @@ export const HardwareRecovery: Plugin = async (ctx) => {
 ```typescript
 // .opencode/plugins/stuck-detection.ts
 //
-// Catches the agent repeating the same tool call 3+ times in a row,
-// which indicates it's stuck in a loop. Injects a warning message.
+// Catches the agent repeating the same tool call 3+ times in a row.
 //
-// HOOK API NOTE: tool.execute.before may support modifying the tool input
-// or injecting a message. If not, the fallback is to write a sentinel file
-// that the agent's system prompt tells it to check.
+// VERIFIED API:
+//   tool.execute.before: (input, output) => void
+//     input: { tool: string, sessionID: string, callID: string }
+//     output: { args: any }  ← mutable: can modify tool arguments before execution
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { writeFileSync } from "fs";
 
-export const StuckDetection: Plugin = async (ctx) => {
+export const StuckDetection: Plugin = async () => {
     let lastToolSig = "";
     let repeatCount = 0;
 
     return {
-        'tool.execute.before': async (toolCall, output) => {
-            // Defensively build signature — exact field names TBD
-            const name = String((toolCall as any)?.name ?? (toolCall as any)?.tool ?? "");
-            const input = JSON.stringify((toolCall as any)?.input ?? {});
-            const sig = `${name}:${input}`;
+        'tool.execute.before': async (input, output) => {
+            const sig = `${input.tool}:${JSON.stringify(output.args)}`;
 
             if (sig === lastToolSig) {
                 repeatCount++;
                 if (repeatCount >= 3) {
-                    // Write sentinel file — agent's system prompt says to check this
+                    // Write sentinel file — agent's system prompt tells it to check this
                     writeFileSync("findings/_stuck_warning.txt",
-                        `WARNING: Repeated identical tool call ${repeatCount} times: ${name}. ` +
+                        `WARNING: Repeated identical tool call ${repeatCount} times: ${input.tool}. ` +
                         `Try a DIFFERENT approach or output your completion promise.`);
-                    // Also try to modify output if the hook API supports it
-                    if (output && typeof output === 'object') {
-                        (output as any).message =
-                            "You have repeated the same tool call 3+ times. Try something different.";
+
+                    // If it's a bash command, we can modify the args to inject a warning
+                    if (input.tool === "bash" && output.args?.command) {
+                        output.args.command =
+                            `echo "[STUCK] You repeated this command ${repeatCount} times. ` +
+                            `Try a different approach." && ${output.args.command}`;
                     }
                 }
             } else {
@@ -894,32 +913,42 @@ export const StuckDetection: Plugin = async (ctx) => {
 // .opencode/plugins/audit-log.ts
 //
 // Logs every tool invocation to findings/audit_log.jsonl for the pentest report.
-// Also provides forensic trail for regulatory compliance.
+//
+// VERIFIED API:
+//   tool.execute.before: (input, output) => void
+//     input: { tool: string, sessionID: string, callID: string }
+//     output: { args: any }
+//   tool.execute.after: (input, output) => void
+//     input: { tool: string, sessionID: string, callID: string, args: any }
+//     output: { title: string, output: string, metadata: any }
 
 import type { Plugin } from "@opencode-ai/plugin"
 import { appendFileSync, mkdirSync } from "fs";
 
-export const AuditLog: Plugin = async (ctx) => {
+export const AuditLog: Plugin = async () => {
     // Ensure findings dir exists
     try { mkdirSync("findings", { recursive: true }); } catch {}
 
     return {
-        'tool.execute.before': async (toolCall, _output) => {
+        'tool.execute.before': async (input, output) => {
             const entry = {
                 timestamp: new Date().toISOString(),
                 phase: "before",
-                tool: (toolCall as any)?.name ?? "unknown",
-                input: (toolCall as any)?.input ?? {},
+                tool: input.tool,
+                sessionID: input.sessionID,
+                args: output.args,
             };
             appendFileSync("findings/audit_log.jsonl", JSON.stringify(entry) + "\n");
         },
-        'tool.execute.after': async (toolCall, output) => {
+        'tool.execute.after': async (input, output) => {
             const entry = {
                 timestamp: new Date().toISOString(),
                 phase: "after",
-                tool: (toolCall as any)?.name ?? "unknown",
-                success: !(output as any)?.error,
-                output_preview: String((output as any)?.stdout ?? "").slice(0, 200),
+                tool: input.tool,
+                sessionID: input.sessionID,
+                args: input.args,
+                title: output.title,
+                output_preview: (output.output ?? "").slice(0, 200),
             };
             appendFileSync("findings/audit_log.jsonl", JSON.stringify(entry) + "\n");
         },
@@ -1122,6 +1151,11 @@ This is the full project-level config file. Lives at `.opencode/opencode.json`.
 {
     "$schema": "https://opencode.ai/config.json",
 
+    // default_agent is swapped by the orchestrator before each phase invocation.
+    // This controls which agent handles `opencode -p` prompts.
+    // Initial value doesn't matter — orchestrator overwrites it per phase.
+    "default_agent": "bellum-recon",
+
     // YOLO: allow all tool operations without prompting
     "permission": {
         "*": "allow",
@@ -1185,24 +1219,32 @@ This is the full project-level config file. Lives at `.opencode/opencode.json`.
 
 ---
 
-## Agent Invocation: `--agent` Flag Status
+## Agent Invocation: How to Select Agents in `-p` Mode
 
-The orchestrator uses `opencode -p --agent bellum-recon [prompt]` syntax. This needs verification:
+**VERIFIED: There is NO `--agent` or `--model` flag.** ([Issue #277](https://github.com/opencode-ai/opencode/issues/277) requested `--model` but was never implemented before the repo was archived.)
+
+The complete `-p` mode flags are: `-f`, `-q`, `--verbose`, `--allowedTools`, `--excludedTools`, `--cwd`.
+
+### Our Solution: `default_agent` Config Swap
+
+The `default_agent` key in `opencode.json` controls which primary agent handles `-p` prompts. The orchestrator writes the agent name to this config key before each `opencode -p` invocation:
+
+```typescript
+// Before each phase:
+config.default_agent = "bellum-recon";  // or bellum-research, etc.
+writeFileSync("opencode.json", JSON.stringify(config));
+// Then:
+exec(`opencode -p "prompt" -q`);  // uses bellum-recon as the default agent
+```
+
+This is a **zero-fork-change** approach. No CLI modifications needed.
 
 | Method | Status | Notes |
 |--------|--------|-------|
-| `opencode -p --agent <name> "prompt"` | **UNVERIFIED** | May not exist in upstream CLI. Need to check `opencode -p --help`. |
-| `opencode -p "@bellum-recon prompt here"` | **Likely works** | `@mention` syntax is documented for agent selection in interactive mode. May work in `-p` mode. |
-| `opencode -p "prompt" --allowedTools=...` | **VERIFIED** | Can restrict tool access per invocation. |
-| Fork: add `--agent` flag to CLI | **Our fallback** | ~10 lines in the CLI parser. Already forking, so easy to add. |
-
-**Implementation plan:** Try `@mention` syntax first. If that doesn't work in `-p` mode, add `--agent` to the fork's CLI parser. Either way, this is a small change.
-
-The orchestrator code includes a comment flagging this:
-```typescript
-// NOTE: --agent flag needs verification against actual OpenCode CLI.
-// Fallback: prefix prompt with "@bellum-recon" mention syntax.
-```
+| `"default_agent": "bellum-recon"` in `opencode.json` | **VERIFIED** | Controls which primary agent handles `-p` prompts. Orchestrator swaps this per phase. |
+| `opencode -p "@bellum-recon prompt"` | **UNVERIFIED for -p** | `@mention` is documented for subagent invocation in TUI. May work in `-p` mode since prompt is processed as a regular message. |
+| `--allowedTools=...` / `--excludedTools=...` | **VERIFIED** | Can further restrict tools per invocation (e.g., report phase: `--excludedTools=bash`). |
+| `--cwd` | **VERIFIED** | Sets working directory — we use this instead of `{ cwd }` in exec options. |
 
 ---
 
@@ -1216,7 +1258,7 @@ The orchestrator code includes a comment flagging this:
 | **Spawn model** | N/A | N/A | Nested subagents | **`opencode -p` per phase (depth 0) + Task (depth 1)** |
 | **Permission model** | N/A | N/A | Assumed inheritance | **-p auto-approve + global allow + plugin fallback** |
 | **Upstream bugs** | Not considered | Not considered | Not considered | **3 bugs documented, all sidestepped by architecture** |
-| **Fork diff** | N/A | ~200 LOC | ~230 LOC | **~20 lines in task.ts + ~230 LOC additive + ~10 LOC CLI flag** |
+| **Fork diff** | N/A | ~200 LOC | ~230 LOC | **~20 lines in task.ts + ~270 LOC additive (no CLI changes needed)** |
 | **Parallelism** | None | Within-phase | Concrete | **Multiple Task calls in one message (proven pattern)** |
 | **Orchestrator** | N/A | Pseudocode | Real TS | **Real TS using `opencode -p` process invocations** |
 | **Demo readiness** | Theoretical | Plausible | Demoable | **Tested against real OpenCode constraints** |

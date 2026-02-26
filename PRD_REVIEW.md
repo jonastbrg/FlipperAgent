@@ -173,12 +173,12 @@ bellum/                                   # forked from opencode
 - **Files are shared memory.** No token context carries between phases. Each phase reads findings from disk, writes updated findings. Infinite effective context.
 
 **Honest trade-offs:**
-- Fork maintenance burden (but additions are isolated: ~20 lines changed in `task.ts`, ~270 LOC additive in `src/bellum/`, ~10 LOC for `--agent` CLI flag)
+- Fork maintenance burden (but additions are isolated: ~20 lines changed in `task.ts`, ~270 LOC additive in `src/bellum/`, zero CLI changes)
 - Bun runtime dependency (one extra install)
 - Python scripts called via Bash (not native OpenCode tools — but simpler, no TS wrappers needed)
 - OpenCode's TUI is coding-oriented (but the agent prompts fully override the behavior)
 - Three upstream subagent bugs require awareness; architecture sidesteps all three, but fork fixes (~20 LOC in `task.ts`) add robustness
-- `--agent` CLI flag and plugin hook field names need validation against actual OpenCode source at implementation time
+- Agent selection in `-p` mode uses `default_agent` config swap (verified approach, no `--agent` flag exists)
 
 ### 3.2 CAI (Cybersecurity AI) — STRONG RUNNER-UP
 
