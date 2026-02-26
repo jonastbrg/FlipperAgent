@@ -10,7 +10,7 @@
 
 This is an ambitious, well-structured PRD for building an autonomous AI agent that bridges digital and physical-layer offensive security. The vision is compelling and the competitive differentiation (no one else combines autonomous AI reasoning + physical-layer attack tools) is genuine. The scope is large but feasible given the development approach: **Claude Code with parallel subagents running 24/7**, leveraging existing codebases (CAI, flipperzero-mcp, pyFlipper, Bleak) rather than building from scratch.
 
-**Overall assessment:** Strong vision. The key architectural decision is framework choice — CAI is the strongest candidate. Error handling/recovery is the biggest gap that needs to be designed into the architecture from day one.
+**Overall assessment:** Strong vision. The key architectural decision is framework choice — **OpenCode is the winner**. It provides the agent loop, MCP integration, multi-model LLM support, Skills system, custom tools, and a polished TUI out of the box — all without writing a single line of framework code. Error handling/recovery is the biggest gap that needs to be designed into the architecture from day one.
 
 ---
 
@@ -97,123 +97,117 @@ The PRD focuses on the agent's offensive capabilities but doesn't address the se
 
 ## 3. Agent Framework Decision — Detailed Analysis
 
-The PRD lists four options (Section 4.3): Custom ReAct loop, CAI, OpenCode + MCP, LangChain/LangGraph. After researching the current state of these frameworks, here's an updated analysis including Kilo Code and OpenCode:
+The PRD lists four options (Section 4.3): Custom ReAct loop, CAI, OpenCode + MCP, LangChain/LangGraph. After deep research on all candidates, including hands-on analysis of architecture, extensibility, and fit for a hackathon with 9 days to demo:
 
-### 3.1 CAI (Cybersecurity AI) — STRONGEST CANDIDATE
+### 3.1 OpenCode — THE WINNER
 
-**GitHub:** [aliasrobotics/cai](https://github.com/aliasrobotics/cai)
+**GitHub:** [sst/opencode](https://github.com/sst/opencode) (also [anomalyco/opencode](https://github.com/anomalyco/opencode))
+**Docs:** [opencode.ai](https://opencode.ai/)
+**Stars:** ~111,000 | **License:** MIT | **Latest:** v1.2.14 (Feb 25, 2026) | **Contributors:** 776
+
+OpenCode is an open-source, provider-agnostic AI agent for the terminal — essentially open-source Claude Code. It has a ReAct-style agent loop under the hood, but the key insight is: **you don't need to write any framework code.** Everything Bellum needs is configurable without touching OpenCode's 111K LOC codebase.
+
+**Why OpenCode wins for Bellum:**
+
+| Feature | How It Maps to Bellum |
+|---------|----------------------|
+| **MCP support (native, first-class)** | `flipperzero-mcp` plugs in directly. Write additional MCP servers for BLE/RF tools. Config-only integration. |
+| **Custom tools** (`.opencode/tools/`) | TS/JS files that shell out to Python scripts (Bleak, pyFlipper, Scapy, nmap). Tool = file. |
+| **Skills system** (`.opencode/skills/`) | Encode attack chain workflows, recon patterns, exploit templates as SKILL.md files. Agent loads on demand. |
+| **Custom agents** (`.opencode/agents/`) | Define `bellum-recon`, `bellum-exploit`, `bellum-report` agents with different LLMs, tools, and system prompts. |
+| **75+ LLM providers** | MiniMax, Kimi, Ollama, Claude, DeepSeek, Groq — all via config. Different model per agent. |
+| **Non-interactive mode** | `opencode "scan all BLE devices and identify vulnerable GATT services"` — scriptable, demoable. |
+| **Polished TUI** | Demo-ready out of the box. Judges see a clean interface, not raw terminal scroll. |
+| **Client/server architecture** | Run on laptop, drive from phone via HTTP API if needed. |
+| **Plugin hooks** | `tool.execute.before` for audit logging, `permission.ask` for HITL on dangerous operations. |
+| **Git-based snapshots** | Every action tracked — critical for red team audit trail. |
+| **MIT license** | No commercial restrictions. Clean for Parabellum AI. |
+
+**What OpenCode gives you for free (zero framework code):**
+- ReAct agent loop with tool dispatch (battle-tested, 2.5M monthly users)
+- LLM provider routing (75+ providers, per-agent model selection)
+- MCP protocol handling (local stdio + remote SSE + OAuth)
+- Skills system for reusable workflow instructions
+- Session management, context compression, subagent delegation
+- Polished TUI with real-time streaming
+- Non-interactive mode for scripted attack chains
+
+**What you build (your actual IP):**
+- MCP servers / custom tools wrapping Flipper Zero, Bleak, nmap, Scapy
+- Skills encoding attack chain patterns (BLE recon, RF replay, zero-knowledge assessment)
+- Agent definitions with red-team system prompts
+- Python scripts that actually talk to hardware
+
+**The play — extend via config, don't fork:**
+
+```
+.opencode/
+├── agents/
+│   ├── bellum-recon.md        # RF/BLE/WiFi recon agent (uses fast model)
+│   ├── bellum-exploit.md      # Exploit development agent (uses strong reasoning model)
+│   └── bellum-report.md       # Pentest report generator
+├── tools/
+│   ├── ble-scan.ts            # shells out to Python/Bleak
+│   ├── ble-write.ts           # shells out to Python/Bleak
+│   ├── subghz-capture.ts      # shells out to flipper-cli/pyFlipper
+│   ├── nmap-scan.ts           # shells out to nmap
+│   └── cve-search.ts          # NVD API call
+├── skills/
+│   ├── ble-attack-chain/SKILL.md      # BLE recon → enumerate → exploit workflow
+│   ├── rf-replay/SKILL.md             # Sub-GHz capture → replay workflow
+│   └── zero-knowledge-target/SKILL.md # Full blackbox assessment workflow
+└── opencode.json              # MCP servers, model config, agent wiring
+```
+
+**Honest trade-offs:**
+- Tools are TS/JS (but shell out to Python — your actual hardware code stays Python)
+- System prompts are coding-oriented by default (but custom agents override this entirely)
+- 111K LOC codebase you don't touch (complexity is in the framework, not your config)
+- Bun runtime dependency (one extra install, not a dealbreaker)
+- Context window consumption (~20K tokens per MCP server — manage by keeping tool count focused)
+
+### 3.2 CAI (Cybersecurity AI) — STRONG RUNNER-UP
+
+**GitHub:** [aliasrobotics/cai](https://github.com/aliasrobotics/cai) (~7,500 stars)
 **Docs:** [aliasrobotics.github.io/cai](https://aliasrobotics.github.io/cai/)
 
-**Why CAI is the best fit for Bellum:**
+CAI is purpose-built for offensive security by a robotics security company (Alias Robotics). It has deep OT/IoT/ROS expertise and has been deployed against industrial robots, MQTT brokers, and fleet management systems. The ReAct loop, 300+ model support, `@function_tool` decorator, and MCP integration are all excellent.
 
-| Feature | Relevance to Bellum |
-|---------|-------------------|
-| **Purpose-built for offensive security** | No need to fight framework assumptions; security operations are first-class |
-| **ReAct pattern already implemented** | Core agent loop is done — focus effort on tools, not infrastructure |
-| **300+ LLM models supported** | Multi-provider strategy works out of the box, including Chinese models |
-| **Custom tools via `@function_tool` decorator** | Adding Flipper Zero / BLE tools is trivial — write a Python function, decorate it, pass to agent |
-| **MCP support (SSE + stdio)** | flipperzero-mcp plugs in directly as an MCP server |
-| **Built-in tools** | LinuxCmd (command execution), WebSearch (OSINT), Code (dynamic scripts), SSHTunnel — these overlap with PRD's digital/research tools |
-| **Agent-as-tool pattern** | Specialized agents (BLE recon agent, exploit agent, report agent) can be composed |
-| **Guardrails & HITL** | Human-in-the-loop for dangerous operations (e.g., BadUSB execution) |
-| **Python-based** | Same language as Bleak, pyFlipper, Scapy — no FFI boundary |
-| **Robot security case study** | Already used for robot fleet security (Sublight Shipping case study via MCP) — directly relevant |
+**Why it's the runner-up, not the winner:**
 
-**What CAI gives you for free:**
-- ReAct agent loop with tool dispatch
-- LLM provider abstraction (300+ models)
-- Built-in command execution, web search, code execution, SSH
-- MCP integration for Flipper Zero
-- Tracing and logging
-- Agent composition (agent-as-tool)
+| Concern | Impact |
+|---------|--------|
+| **Non-commercial license** | Hackathon is fine, but Parabellum AI commercial use requires CAI PRO license or a fork. OpenCode is MIT. |
+| **Python-only ecosystem** | Fine for tools, but no polished TUI for demos. Terminal output is raw. |
+| **Smaller community** | ~7.5K stars vs 111K. Fewer plugins, less ecosystem support. |
+| **More framework to learn** | Patterns, Handoffs, Guardrails, Turns, Tracing — powerful but opinionated. |
+| **No Skills system** | Attack workflows need to be hardcoded in system prompts, not loaded on demand. |
 
-**What you still need to build:**
-- Physical-layer tools (BLE via Bleak, Sub-GHz/IR via pyFlipper) as `@function_tool` functions
-- Attack planning prompts (system prompts for the offensive security domain)
-- Report generation (Jinja2 templates)
-- Error handling/recovery layer (see Section 2.3)
-- Configuration management
+**When to choose CAI instead:** If the Python-native tool integration (no TS→Python shell-out) outweighs the UX and licensing advantages of OpenCode. Or if you need CAI's security-specific guardrails and tracing for a production deployment.
 
-**Licensing note:** CAI is open source for non-commercial research. The hackathon qualifies. For Parabellum AI commercial use later, you'd need a CAI PRO license or fork the MIT-licensed parts (derived from openai-agents-python).
+### 3.3 Custom ReAct Loop — ELIMINATED
 
-### 3.2 OpenCode — VIABLE ALTERNATIVE (Development Tool + Potential Runtime)
+With OpenCode providing the full agent loop, MCP integration, multi-model support, Skills, and custom tools via config-only extension, building a custom ReAct loop is reinventing the wheel. The ~200 LOC simplicity argument doesn't hold when OpenCode gives you all that for zero framework code while also providing a polished TUI, session management, and plugin hooks.
 
-**GitHub:** [opencode-ai/opencode](https://github.com/opencode-ai/opencode) (100K+ stars)
-**Docs:** [opencode.ai](https://opencode.ai/)
+### 3.4 LangChain/LangGraph — ELIMINATED
 
-OpenCode is a Go-based terminal AI agent with 100K+ stars. It's primarily a coding agent, but its architecture is relevant:
-
-| Feature | Relevance |
-|---------|-----------|
-| **Primary agents + subagents** | Could model attack phases as subagents (recon agent, exploit agent, report agent) |
-| **MCP support** | flipperzero-mcp works as an MCP server |
-| **Custom tools via plugins** | `.opencode/plugins/` for extending capabilities |
-| **Multi-provider LLM** | OpenAI, Anthropic, Google, Groq, OpenRouter, etc. |
-| **Agent permissions** | Control which tools each agent can access |
-
-**Pros for Bellum:**
-- Extremely mature and battle-tested (100K+ stars, 700+ contributors)
-- MCP ecosystem is well-established
-- Could serve as both the development environment AND the runtime agent
-- Custom agents can be defined in config files
-
-**Cons for Bellum:**
-- **Not security-focused** — would need significant customization for offensive security workflows
-- **Go-based core** — custom tools need to go through MCP or plugin system, not direct Python integration. The BLE/Flipper tools are all Python (Bleak, pyFlipper, Scapy).
-- **Coding agent assumptions** — built-in tools are file editing, code search, etc. Not network scanning, BLE enumeration, RF capture.
-- **Overkill** — brings a full TUI, SQLite session storage, LSP integration that Bellum doesn't need
-
-**Verdict:** Better as a development tool (alternative/complement to Claude Code) than as the Bellum runtime. However, if you want to quickly prototype the agent by defining custom MCP tools and running them through OpenCode's agent loop, it could work for the hackathon demo with less custom code.
-
-### 3.3 Kilo Code — DEVELOPMENT TOOL, NOT RUNTIME
-
-**GitHub:** [Kilo-Org/kilocode](https://github.com/Kilo-Org/kilocode) (13K+ stars)
-**Docs:** [kilo.ai](https://kilo.ai/)
-
-Kilo Code is a fork/superset of Cline/Roo Code. It's a VS Code extension + CLI for AI-assisted coding.
-
-| Feature | Relevance |
-|---------|-----------|
-| **Agent Manager with git worktree isolation** | Useful for running multiple development subagents in parallel |
-| **Orchestrator mode** | Breaks complex tasks into subtasks across modes |
-| **MCP marketplace** | Ecosystem of MCP tools |
-| **Custom modes** | Could create a "Security" mode with restricted tool access |
-| **CLI with `--auto` flag** | Fully autonomous operation for CI/CD |
-
-**Pros for Bellum:**
-- **Agent Manager** is great for parallel development — spin up multiple agents working on different tools simultaneously
-- **Orchestrator mode** could coordinate the attack chain phases
-- Custom modes + tool group filtering could restrict agents to security-relevant tools
-- TypeScript/Node.js based — different ecosystem but MCP bridges the gap
-
-**Cons for Bellum:**
-- **Not security-focused** — same issue as OpenCode
-- **TypeScript core** — all physical tools (Bleak, pyFlipper, Scapy) are Python; would need MCP bridges for everything
-- **VS Code dependency** — the full power is in the IDE extension, less so in the CLI
-- **Primarily a coding agent** — the core loop is "read code, think, edit code", not "scan target, think, exploit target"
-
-**Verdict:** Excellent as a development tool for building Bellum (especially the Agent Manager for parallel workstreams). Not suitable as the Bellum runtime itself. Could complement Claude Code for development.
-
-### 3.4 Custom ReAct Loop — FALLBACK OPTION
-
-Still viable if CAI introduces too much friction. But given that CAI already implements ReAct with tool dispatch, multi-model support, and MCP integration, building from scratch would be duplicating work.
-
-**When to go custom:** If CAI's licensing is a problem for commercial use, or if CAI's opinionated architecture conflicts with specific Bellum requirements (e.g., physical tool latency handling, hardware reconnection logic).
+Heavyweight, not security-focused, abstractions on abstractions. No advantage over OpenCode for this use case.
 
 ### 3.5 Framework Recommendation
 
 ```
-RECOMMENDED: CAI as the agent runtime
-├── Provides: ReAct loop, LLM abstraction, tool dispatch, MCP, tracing
-├── You build: Physical tools (@function_tool), attack prompts, reporting, error recovery
-└── Risk: Non-commercial license for hackathon is fine; commercial use needs CAI PRO or fork
+RECOMMENDED: OpenCode as the agent runtime
+├── Provides: Agent loop, MCP, Skills, custom tools, custom agents, 75+ LLM providers, TUI
+├── You build: Hardware tools (MCP/custom tools), attack skills (SKILL.md), agent prompts
+├── Extend: Config-only, no forking, MIT license
+└── Time to first demo: ~1-2 days (once tools are wired)
 
-ALTERNATIVE: OpenCode as quick-prototype runtime
-├── Provides: Agent loop, MCP integration, multi-provider LLM, session management
-├── You build: All tools as MCP servers (Python→MCP bridge), attack prompts
-└── Risk: Go/Python boundary via MCP adds latency and complexity
+FALLBACK: CAI as the agent runtime
+├── Provides: ReAct loop, 300+ models, @function_tool, MCP, security-native
+├── You build: Physical tools, attack prompts, reporting, TUI/demo interface
+└── When: If OpenCode's TS→Python shell-out latency is a problem, or if you need CAI's guardrails
 
-DEVELOPMENT TOOLS: Claude Code (primary) + Kilo Code Agent Manager (parallel workstreams)
+DEVELOPMENT: Claude Code (primary) for building the tools and MCP servers
 ```
 
 ---
@@ -329,35 +323,43 @@ Physical tools have unique failure modes:
 
 ## 6. Summary of Recommendations
 
-1. **Use CAI as the agent framework.** It provides the ReAct loop, multi-model LLM support, MCP integration, and built-in security tools. Build physical-layer tools as `@function_tool` extensions. This eliminates the "build vs. buy" question for the agent core.
-2. **Design error handling from day one.** Tool retry logic, agent pivot logic, context compression, checkpointing, and hardware recovery. This is the section in this review to spend the most time on (Section 4).
-3. **Test LLM providers against offensive prompts immediately.** The demo depends on the LLM cooperating. Test before building.
-4. **Leverage existing codebases aggressively.** CAI for the agent, flipperzero-mcp for Flipper integration, Bleak for BLE, pyFlipper for serial. Don't rewrite what exists.
-5. **Use Claude Code subagents for parallel development.** Different tools, different workstreams, simultaneously. Kilo Code's Agent Manager could supplement this for VS Code-based work.
-6. **Specify the `code_execute` sandbox.** Docker container or nsjail at minimum.
-7. **Prepare a no-Flipper contingency.** BLE via laptop Bleak is the primary demo path. Flipper Zero adds Sub-GHz/IR but isn't required for the core BLE attack demo.
-8. **Align repo naming.** "Bellum" vs "FlipperAgent" — pick one.
+1. **Use OpenCode as the agent runtime.** It provides the agent loop, MCP integration, Skills system, custom tools, custom agents, 75+ LLM providers, and a polished TUI — all via config-only extension, no forking, MIT license. Your code stays focused on hardware integration and attack workflows.
+2. **Extend via `.opencode/` config, don't fork.** Custom agents for attack phases (recon, exploit, report). Custom tools that shell out to Python (Bleak, pyFlipper, Scapy). Skills for reusable attack chain workflows. MCP servers for Flipper Zero hardware interface.
+3. **Design error handling from day one.** Tool retry logic, agent pivot logic, context compression, checkpointing, and hardware recovery. This is the section in this review to spend the most time on (Section 4). OpenCode's plugin hooks (`tool.execute.before/after`) can help implement this.
+4. **Test LLM providers against offensive prompts immediately.** The demo depends on the LLM cooperating. Test MiniMax M2.5, Kimi K2.5 against actual attack prompts before committing development effort.
+5. **Leverage existing codebases aggressively.** OpenCode for the agent runtime, flipperzero-mcp for Flipper integration, Bleak for BLE, pyFlipper for serial. Don't rewrite what exists.
+6. **Use Claude Code for parallel development.** Different tools, different workstreams, simultaneously.
+7. **Specify the `code_execute` sandbox.** Docker container or nsjail at minimum.
+8. **Prepare a no-Flipper contingency.** BLE via laptop Bleak is the primary demo path. Flipper Zero adds Sub-GHz/IR but isn't required for the core BLE attack demo.
+9. **Align repo naming.** "Bellum" vs "FlipperAgent" — pick one.
 
 ---
 
 ## Appendix: Framework Comparison Matrix
 
-| Criterion | CAI | OpenCode | Kilo Code | Custom ReAct |
-|-----------|-----|----------|-----------|-------------|
-| **Security-focused** | Yes (purpose-built) | No | No | You build it |
-| **ReAct loop** | Built-in | Built-in (for coding) | Built-in (for coding) | You build it |
-| **MCP support** | Yes (SSE + stdio) | Yes | Yes | You build it |
-| **Custom tools** | `@function_tool` (Python) | Plugins (Go/MCP) | MCP / custom registry | Direct Python |
-| **Multi-model LLM** | 300+ models | Major providers | 500+ via OpenRouter | Via litellm |
-| **Python ecosystem** | Native (Bleak, Scapy, pyFlipper) | MCP bridge needed | MCP bridge needed | Native |
-| **Agent composition** | Agent-as-tool | Subagents | Orchestrator mode | You build it |
-| **Error recovery** | Basic (HITL, guardrails) | Session management | N/A | You build it |
-| **Community size** | Small (security niche) | 100K+ stars | 13K+ stars | N/A |
-| **License** | Non-commercial research | MIT | Apache 2.0 | N/A |
-| **Hackathon fit** | Excellent | Good | Fair | Good |
-| **Time to first demo** | ~2 days | ~3 days | ~4 days | ~4 days |
+| Criterion | OpenCode | CAI | Custom ReAct |
+|-----------|----------|-----|-------------|
+| **Security-focused** | No (but fully customizable via agents/skills) | Yes (purpose-built) | You build it |
+| **Agent loop** | Built-in (ReAct-style) | Built-in (ReAct) | You build it |
+| **MCP support** | First-class (stdio + SSE + OAuth) | Yes (SSE + stdio) | You build it |
+| **Custom tools** | `.opencode/tools/` (TS→shell out to Python) | `@function_tool` (native Python) | Direct Python |
+| **Skills / workflows** | SKILL.md system (on-demand loading) | None (hardcoded prompts) | You build it |
+| **Custom agents** | Config/markdown (per-agent model, tools, prompts) | Agent-as-tool composition | You build it |
+| **Multi-model LLM** | 75+ providers (per-agent model selection) | 300+ models via LiteLLM | Via litellm |
+| **Python ecosystem** | Shell out from TS tools | Native (Bleak, Scapy, pyFlipper) | Native |
+| **Plugin hooks** | 25+ lifecycle hooks (audit, permissions, etc.) | Guardrails + HITL | You build it |
+| **Demo UX** | Polished TUI out of the box | Raw terminal output | You build it |
+| **Non-interactive mode** | Yes (`opencode "prompt"`) | Yes (`cai --prompt "..."`) | You build it |
+| **Community** | 111K stars, 776 contributors, 2.5M users | ~7.5K stars, niche | N/A |
+| **License** | MIT | Non-commercial research | N/A |
+| **Hackathon fit** | Excellent (config-only extension) | Good (some learning curve) | Fair (build everything) |
+| **Time to first demo** | ~1-2 days | ~2-3 days | ~3-4 days |
+
+**Winner: OpenCode.** Best ratio of infrastructure-for-free to custom-code-required. MIT license. Demo-ready TUI. Config-only extension model means all development effort goes into the actual hardware tools and attack workflows — not plumbing.
 
 **Sources:**
+- [OpenCode GitHub](https://github.com/sst/opencode) | [OpenCode Docs](https://opencode.ai/)
 - [CAI GitHub](https://github.com/aliasrobotics/cai) | [CAI Docs](https://aliasrobotics.github.io/cai/)
-- [OpenCode GitHub](https://github.com/opencode-ai/opencode) | [OpenCode Docs](https://opencode.ai/)
-- [Kilo Code GitHub](https://github.com/Kilo-Org/kilocode) | [Kilo Code Docs](https://kilo.ai/)
+- [OpenCode Skills Docs](https://opencode.ai/docs/skills/) | [OpenCode MCP Docs](https://opencode.ai/docs/mcp-servers/)
+- [OpenCode Custom Tools Docs](https://opencode.ai/docs/custom-tools/) | [OpenCode Agents Docs](https://opencode.ai/docs/agents/)
+- [OpenCode Plugins Docs](https://opencode.ai/docs/plugins/)
