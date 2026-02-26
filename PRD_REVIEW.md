@@ -138,33 +138,43 @@ OpenCode is an open-source, provider-agnostic AI agent for the terminal — esse
 - Agent definitions with red-team system prompts
 - Python scripts that actually talk to hardware
 
-**The play — extend via config, don't fork:**
+**The play — fork OpenCode, add orchestration layer:**
+
+We don't just extend via config — we fork and add a **ralph loop orchestrator** that drives the attack state machine externally. The LLM does the work within each phase; deterministic code sequences the phases, validates output, and handles pivot logic.
 
 ```
-.opencode/
-├── agents/
-│   ├── bellum-recon.md        # RF/BLE/WiFi recon agent (uses fast model)
-│   ├── bellum-exploit.md      # Exploit development agent (uses strong reasoning model)
-│   └── bellum-report.md       # Pentest report generator
-├── tools/
-│   ├── ble-scan.ts            # shells out to Python/Bleak
-│   ├── ble-write.ts           # shells out to Python/Bleak
-│   ├── subghz-capture.ts      # shells out to flipper-cli/pyFlipper
-│   ├── nmap-scan.ts           # shells out to nmap
-│   └── cve-search.ts          # NVD API call
-├── skills/
-│   ├── ble-attack-chain/SKILL.md      # BLE recon → enumerate → exploit workflow
-│   ├── rf-replay/SKILL.md             # Sub-GHz capture → replay workflow
-│   └── zero-knowledge-target/SKILL.md # Full blackbox assessment workflow
-└── opencode.json              # MCP servers, model config, agent wiring
+bellum/                                   # forked from opencode
+├── packages/opencode/src/bellum/         # OUR ADDITIONS (~200 LOC)
+│   ├── orchestrator.ts                   # Phase sequencing, ralph loop runner
+│   ├── ralph.ts                          # Ralph Wiggum loop implementation
+│   ├── state.ts                          # EngagementState types
+│   ├── gates.ts                          # Backpressure gate validators
+│   └── prompts/                          # Phase prompt templates
+├── scripts/                              # Python tools (called via Bash)
+│   ├── hardware/                         # ble_scan.py, ble_write.py, subghz_*.py, etc.
+│   ├── recon/                            # cve_search.py, shodan_search.py, github_search.py
+│   └── util/                             # packet_analyze.py, firmware_analyze.py
+├── .opencode/
+│   ├── skills/                           # Attack workflow instructions (SKILL.md)
+│   ├── plugins/                          # HITL gate, hardware recovery, audit log
+│   └── opencode.json                     # MCP servers, model config
+├── findings/                             # Runtime output (phase JSONs)
+├── checkpoints/                          # Crash recovery
+└── reports/                              # Generated pentest reports
 ```
+
+**Key architecture decisions:**
+- **Ralph loops** (from [ralph-wiggum plugin](https://github.com/anthropics/claude-code/blob/main/plugins/ralph-wiggum/README.md)) iterate each phase until completion criteria met. The LLM's previous work persists in files — each iteration sees fresh context + file state.
+- **Backpressure gates** block phase transitions until output validates (e.g., recon must produce >= 1 surface before research can start).
+- **OpenCode's built-in tools** (Bash, WebSearch, WebFetch, Read/Write, Task, TodoWrite) cover half the PRD's tool list for free. Hardware tools are Python scripts called via Bash.
+- **Subagents** (OpenCode's Task tool) enable parallel execution within phases — BLE scan + nmap + SubGHz scan running simultaneously.
+- **Files are shared memory.** No token context carries between phases. Each phase reads findings from disk, writes updated findings. Infinite effective context.
 
 **Honest trade-offs:**
-- Tools are TS/JS (but shell out to Python — your actual hardware code stays Python)
-- System prompts are coding-oriented by default (but custom agents override this entirely)
-- 111K LOC codebase you don't touch (complexity is in the framework, not your config)
-- Bun runtime dependency (one extra install, not a dealbreaker)
-- Context window consumption (~20K tokens per MCP server — manage by keeping tool count focused)
+- Fork maintenance burden (but additions are isolated in `src/bellum/`, ~200 LOC)
+- Bun runtime dependency (one extra install)
+- Python scripts called via Bash (not native OpenCode tools — but simpler, no TS wrappers needed)
+- OpenCode's TUI is coding-oriented (but the agent prompts fully override the behavior)
 
 ### 3.2 CAI (Cybersecurity AI) — STRONG RUNNER-UP
 
@@ -196,18 +206,19 @@ Heavyweight, not security-focused, abstractions on abstractions. No advantage ov
 ### 3.5 Framework Recommendation
 
 ```
-RECOMMENDED: OpenCode as the agent runtime
-├── Provides: Agent loop, MCP, Skills, custom tools, custom agents, 75+ LLM providers, TUI
-├── You build: Hardware tools (MCP/custom tools), attack skills (SKILL.md), agent prompts
-├── Extend: Config-only, no forking, MIT license
-└── Time to first demo: ~1-2 days (once tools are wired)
+RECOMMENDED: Fork OpenCode + Ralph Wiggum loops
+├── Provides: Agent loop, MCP, Skills, subagents, 75+ LLM providers, TUI, Bash/WebSearch/Read/Write
+├── We add: Orchestrator (~200 LOC TS), ralph loop runner, backpressure gates
+├── We add: Python scripts for hardware (Bleak, pyFlipper, Scapy), recon APIs (Shodan, NVD, GitHub)
+├── We add: Skills (attack workflows), plugins (HITL gate, hardware recovery, audit)
+├── Architecture: Ralph loops iterate each phase. Files = shared memory. Subagents = parallelism.
+└── Time to first demo: ~1-2 days (once scripts are wired)
 
 FALLBACK: CAI as the agent runtime
-├── Provides: ReAct loop, 300+ models, @function_tool, MCP, security-native
-├── You build: Physical tools, attack prompts, reporting, TUI/demo interface
-└── When: If OpenCode's TS→Python shell-out latency is a problem, or if you need CAI's guardrails
+├── When: If OpenCode fork introduces too much friction, or if native Python tool integration is critical
+└── Trade-off: Better Python integration, worse TUI/UX, non-commercial license
 
-DEVELOPMENT: Claude Code (primary) for building the tools and MCP servers
+DEVELOPMENT: Claude Code (primary) for building the scripts and orchestrator
 ```
 
 ---
@@ -323,8 +334,8 @@ Physical tools have unique failure modes:
 
 ## 6. Summary of Recommendations
 
-1. **Use OpenCode as the agent runtime.** It provides the agent loop, MCP integration, Skills system, custom tools, custom agents, 75+ LLM providers, and a polished TUI — all via config-only extension, no forking, MIT license. Your code stays focused on hardware integration and attack workflows.
-2. **Extend via `.opencode/` config, don't fork.** Custom agents for attack phases (recon, exploit, report). Custom tools that shell out to Python (Bleak, pyFlipper, Scapy). Skills for reusable attack chain workflows. MCP servers for Flipper Zero hardware interface.
+1. **Fork OpenCode + add Ralph Wiggum loop orchestrator.** OpenCode provides the agent loop, subagents, built-in tools (Bash, WebSearch, WebFetch, Read/Write, Task), Skills, MCP, 75+ LLM providers, and TUI. We add ~200 LOC of orchestrator code that drives the attack state machine via ralph loops with backpressure gates. MIT license.
+2. **Python scripts via Bash for hardware tools.** No TS tool wrappers needed. BLE (Bleak), Flipper (pyFlipper), network (nmap, Scapy), recon APIs (Shodan, NVD, GitHub) are all Python scripts in `scripts/` called by the agent via OpenCode's Bash tool. Skills encode attack workflows. Plugins enforce HITL gates and hardware recovery.
 3. **Design error handling from day one.** Tool retry logic, agent pivot logic, context compression, checkpointing, and hardware recovery. This is the section in this review to spend the most time on (Section 4). OpenCode's plugin hooks (`tool.execute.before/after`) can help implement this.
 4. **Test LLM providers against offensive prompts immediately.** The demo depends on the LLM cooperating. Test MiniMax M2.5, Kimi K2.5 against actual attack prompts before committing development effort.
 5. **Leverage existing codebases aggressively.** OpenCode for the agent runtime, flipperzero-mcp for Flipper integration, Bleak for BLE, pyFlipper for serial. Don't rewrite what exists.
