@@ -1,865 +1,863 @@
-# Bellum Agent State Machine v2
+# Bellum Agent State Machine v3
 
-**Version:** 2.0
+**Version:** 3.0
 **Date:** 2026-02-26
-**Architecture:** OpenCode fork + Ralph Wiggum loops + subagent orchestration
+**Architecture:** OpenCode fork + Ralph Wiggum loops + subagent orchestration + yolo mode
 
 ---
 
-## Architecture Change from v1
+## What Changed from v2
 
-v1 assumed the LLM self-manages state transitions via system prompts. That's fragile — the LLM forgets instructions, drifts, loops. v2 uses **external control structures** that guarantee convergence:
+v2 had HITL gates everywhere and treated subagents as an afterthought. v3 flips both:
 
-| Mechanism | What It Does | Source |
-|-----------|-------------|--------|
-| **Ralph loops** | Keep feeding the same phase prompt until completion criteria met | [ralph-wiggum plugin](https://github.com/anthropics/claude-code/blob/main/plugins/ralph-wiggum/README.md) |
-| **Backpressure gates** | Block phase transition until output validates | [ralph-orchestrator](https://github.com/mikeyobrien/ralph-orchestrator) |
-| **Subagents (Task tool)** | Parallel execution within phases, isolated context windows | OpenCode built-in |
-| **Built-in tools** | WebSearch, WebFetch, Bash, Read/Write, TodoWrite — already in OpenCode | OpenCode built-in |
-| **OpenCode fork** | We own the orchestration layer, add ralph runner + custom tools | Our code |
-
-**The key insight:** each phase of the attack chain is a ralph loop. The orchestrator (our fork code) runs the loops sequentially, validates output between them, and passes compressed findings forward. The LLM doesn't manage state — **we** manage state. The LLM just does the work within each phase.
+| v2 | v3 |
+|----|-----|
+| HITL gates on all exploit tools | **Yolo mode by default.** Optional HITL for exploits only, toggled via env var. |
+| Subagents mentioned but vague | **Concrete subagent spawn tree.** Every phase shows exactly which subagents run, in parallel or series, with what tools. |
+| Sequential ralph loops | **Subagents ARE the ralph loops.** The orchestrator spawns phase agents as subagents. Each is a ralph loop. |
+| LLM-managed pivot logic | **Orchestrator-managed pivot.** Deterministic for loop over vectors. |
 
 ---
 
-## High-Level Flow
+## Yolo Mode
+
+**Default: fully autonomous.** No approval prompts. The agent blasts through recon → research → enum → exploit → report without stopping.
+
+**Config (`opencode.json`):**
+```json
+{
+    "permissions": {
+        "allow": [
+            "Bash(*)", "Read(*)", "Write(*)", "Edit(*)",
+            "Glob(*)", "Grep(*)", "WebSearch(*)", "WebFetch(*)",
+            "Task(*)", "TodoWrite(*)"
+        ]
+    }
+}
+```
+
+**Selective HITL (optional, for safety-conscious runs):**
+```typescript
+// .opencode/plugins/exploit-gate.ts
+export default {
+    name: "exploit-gate",
+    hooks: {
+        "permission.ask": async (ctx) => {
+            const dangerous = ["ble_write", "subghz_replay", "ir_replay", "badusb"];
+            const cmd = ctx.tool?.input?.command || "";
+            if (process.env.BELLUM_HITL === "true" &&
+                dangerous.some(d => cmd.includes(d))) {
+                return { action: "ask" };
+            }
+            return { action: "allow" };
+        }
+    }
+};
+```
+
+**Running:**
+```bash
+# Full yolo — zero interaction, full autonomous attack chain
+bellum "Attack that quadruped robot"
+
+# Autonomous everything, pause only before sending payloads to hardware
+BELLUM_HITL=true bellum "Attack that quadruped robot"
+```
+
+Subagents **inherit parent permissions**, so yolo propagates to every subagent in the tree.
+
+---
+
+## High-Level Architecture
 
 ```
-bellum "Attack that quadruped robot"
+$ bellum "Attack that quadruped robot on table 3"
          │
          ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                     BELLUM ORCHESTRATOR                              │
-│                (ralph loop runner — our fork code)                   │
-│                                                                     │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐     │
-│  │  PHASE 0 │───►│ PHASE 1  │───►│ PHASE 2  │───►│ PHASE 3  │     │
-│  │  TARGET   │    │  RECON   │    │ RESEARCH │    │  ENUM    │     │
-│  │ (1 shot) │    │ (loop)   │    │ (loop)   │    │ (loop)   │     │
-│  └──────────┘    └──────────┘    └──────────┘    └──────────┘     │
-│                                                        │            │
-│       ┌────────────────────────────────────────────────┘            │
-│       ▼                                                             │
-│  ┌──────────┐    ┌──────────┐    ┌──────────┐                      │
-│  │ PHASE 4  │───►│ PHASE 5  │───►│ PHASE 6  │                      │
-│  │ EXPLOIT  │    │  PIVOT   │    │  REPORT  │                      │
-│  │ (loop+   │    │(decision)│    │ (loop)   │                      │
-│  │  HITL)   │    └──────────┘    └──────────┘                      │
-│  └──────────┘         │                                             │
-│       ▲               │ more vectors                                │
-│       └───────────────┘                                             │
-│                                                                     │
-│  RECOVERY: interrupt handler, not a phase                           │
-└─────────────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│                     BELLUM ORCHESTRATOR                                │
+│            (deterministic TypeScript — our fork code)                  │
+│                                                                        │
+│  1. acquire_target()           ← no LLM, just hardware checks         │
+│  2. spawn bellum-recon         ← ralph loop subagent (yolo)            │
+│  3. validate surfaces.json    ← backpressure gate                      │
+│  4. spawn bellum-research      ← ralph loop subagent (yolo)            │
+│  5. validate intel.json       ← backpressure gate                      │
+│  6. spawn bellum-enumerate     ← ralph loop subagent (yolo)            │
+│  7. validate vectors.json     ← backpressure gate                      │
+│  8. for vector in vectors:    ← deterministic pivot loop               │
+│       spawn bellum-exploit     ← ralph loop subagent (yolo or HITL)    │
+│       if success: break                                                │
+│  9. spawn bellum-report        ← ralph loop subagent (yolo)            │
+│ 10. done                                                               │
+│                                                                        │
+│  RECOVERY: plugin hooks intercept hardware failures inline             │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+The orchestrator is **~100 lines of deterministic TypeScript**. It has no LLM calls. It just:
+1. Spawns phase agents as subagents (each is a ralph loop)
+2. Reads their output files
+3. Validates via backpressure gates
+4. Decides the next phase (or pivot)
+
+---
+
+## Subagent Spawn Tree
+
+This is the complete hierarchy. Every box is a separate agent with its own context window.
+
+```
+ORCHESTRATOR (TypeScript, no LLM)
+│
+├── bellum-recon (ralph loop, yolo, fast model)
+│   │
+│   │   The recon agent's job: discover attack surfaces.
+│   │   It reads findings/target.json, runs scans, writes findings/surfaces.json.
+│   │
+│   ├── Task("BLE scan for 15 seconds")          ─── parallel ───┐
+│   │   └── Bash: python3 scripts/hardware/ble_scan.py --dur 15  │
+│   │                                                              │
+│   ├── Task("nmap service scan 192.168.0.0/24")  ─── parallel ──┤
+│   │   └── Bash: nmap -sV -T4 192.168.0.0/24 -oJ /tmp/nmap.json│
+│   │                                                              │
+│   ├── Task("SubGHz scan 300-900MHz for 20s")     ─── parallel ──┤
+│   │   └── Bash: python3 scripts/hardware/subghz_scan.py         │
+│   │                                                              │
+│   └── Task("WiFi scan nearby networks")          ─── parallel ──┘
+│       └── Bash: python3 scripts/hardware/wifi_scan.py
+│
+│   All 4 return results → recon agent merges → writes surfaces.json
+│   Ralph loop checks: does surfaces.json have >= 1 surface?
+│   YES → exit loop, return to orchestrator
+│   NO  → re-iterate (try different scan params, longer duration, etc.)
+│
+├── bellum-research (ralph loop, yolo, strong reasoning model)
+│   │
+│   │   The research agent's job: OSINT enrichment.
+│   │   It reads surfaces.json, researches each surface, writes intel.json.
+│   │
+│   ├── Task("Research BLE surface: QUADRUPED-XX")  ─── parallel ──┐
+│   │   ├── WebSearch: "QUADRUPED robot BLE vulnerability 2025"     │
+│   │   ├── WebFetch: (CVE detail page)                             │
+│   │   ├── Bash: python3 scripts/recon/github_search.py "QUADRUPED BLE exploit"
+│   │   └── Bash: python3 scripts/recon/cve_search.py "QUADRUPED"  │
+│   │                                                                │
+│   ├── Task("Research HTTP surface: 192.168.4.1:8080") ── parallel ┤
+│   │   ├── WebSearch: "QUADRUPED robot web API documentation"       │
+│   │   ├── Bash: python3 scripts/recon/shodan_search.py "QUADRUPED"│
+│   │   └── WebFetch: (API docs page)                               │
+│   │                                                                │
+│   └── Task("Research SSH surface: 192.168.4.1:22")  ─── parallel ─┘
+│       ├── WebSearch: "QUADRUPED robot default SSH credentials"
+│       └── Bash: python3 scripts/recon/cve_search.py "OpenSSH 8.9"
+│
+│   All 3 return intel → research agent merges → writes intel.json
+│   Ralph loop checks: does intel.json have >= 1 hypothesis?
+│   YES → exit loop
+│   NO  → re-iterate (broader search terms, different databases)
+│
+├── bellum-enumerate (ralph loop, yolo, strong model)
+│   │
+│   │   The enumeration agent's job: confirm hypotheses, extract attack params.
+│   │   It reads surfaces.json + intel.json, probes target, writes vectors.json.
+│   │
+│   │   (Runs hypotheses in priority order, NOT parallel — interacting with
+│   │    the same target device simultaneously could cause BLE conflicts)
+│   │
+│   ├── Hypothesis H1: BLE GATT write
+│   │   ├── Bash: python3 scripts/hardware/ble_enumerate.py AA:BB:CC:DD:EE:FF
+│   │   ├── Bash: python3 scripts/hardware/ble_read.py AA:BB:CC:DD:EE:FF 0xFFE1
+│   │   └── Result: CONFIRMED — char 0xFFE1 writable, no auth
+│   │
+│   ├── Hypothesis H3: REST API injection
+│   │   ├── Bash: curl -s http://192.168.4.1:8080/api/ | python3 -m json.tool
+│   │   ├── Bash: curl -s http://192.168.4.1:8080/api/status
+│   │   └── Result: CONFIRMED — /api/cmd accepts POST, no auth
+│   │
+│   └── writes vectors.json with confirmed vectors, ranked
+│
+│   Ralph loop checks: does vectors.json have >= 1 confirmed vector?
+│   YES → exit loop
+│   NO  → re-iterate (try different enumeration approaches)
+│
+├── FOR vector IN vectors.json:    ← deterministic pivot loop (orchestrator code)
+│   │
+│   └── bellum-exploit (ralph loop, yolo or HITL, strongest model)
+│       │
+│       │   The exploit agent's job: craft and execute PoC.
+│       │   It reads vectors.json + intel.json, develops exploit, executes it.
+│       │
+│       │   Iteration 1:
+│       ├── WebSearch: "BLE GATT write movement command Bleak example"
+│       ├── Bash: python3 -c "# craft payload based on research..."
+│       ├── Bash: python3 scripts/hardware/ble_write.py AA:BB:CC:DD:EE:FF 0xFFE1 01020032
+│       │         ↑ If BELLUM_HITL=true, plugin intercepts and prompts user
+│       │         ↑ If BELLUM_HITL=false (default), auto-approved, fires immediately
+│       ├── Result: robot moves → SUCCESS
+│       └── writes findings/exploit_V1.json
+│
+│       Ralph loop checks: does exploit_V1.json have non-null "impact"?
+│       YES → exit loop, return success to orchestrator
+│       NO  → re-iterate (different payload, different approach)
+│       Max iterations exhausted → return failure, orchestrator tries next vector
+│
+│   Orchestrator: exploit succeeded? → break out of for loop
+│   Orchestrator: exploit failed? → continue to next vector (PIVOT)
+│   Orchestrator: all vectors failed? → proceed to report anyway
+│
+└── bellum-report (ralph loop, yolo, fast model)
+    │
+    │   The report agent's job: generate pentest report.
+    │   It reads ALL files in findings/, writes reports/bellum-{id}.md.
+    │
+    ├── Read: findings/target.json
+    ├── Read: findings/surfaces.json
+    ├── Read: findings/intel.json
+    ├── Read: findings/vectors.json
+    ├── Read: findings/exploit_V1.json (and any others)
+    └── Write: reports/bellum-{engagement_id}.md
+
+    Ralph loop checks: does report file exist AND have all required sections?
+    YES → exit loop
+    NO  → re-iterate
+```
+
+---
+
+## Agent Definitions
+
+Each phase agent is defined as a custom OpenCode agent. These live in `.opencode/agents/` and specify model, tool access, and system prompt.
+
+### bellum-recon
+
+```yaml
+# .opencode/agents/bellum-recon.md frontmatter
+name: bellum-recon
+description: Cyber-physical reconnaissance agent — discovers attack surfaces
+model: kimi/k2.5          # fast, good tool calling, cheap
+tools:
+  - Bash
+  - Task                   # can spawn parallel scan subagents
+  - Read
+  - Write
+  - Glob
+  - TodoWrite
+```
+
+**System prompt (body of the .md file):**
+```
+You are a reconnaissance agent for an autonomous cyber-physical security evaluation.
+
+Read findings/target.json for the target specification and available hardware.
+Read findings/surfaces.json if it exists (you may be continuing from a previous iteration).
+
+Your mission: discover ALL wireless and network attack surfaces the target exposes.
+
+STRATEGY:
+1. Launch parallel scans using Task tool — one per protocol:
+   - BLE: `python3 scripts/hardware/ble_scan.py --duration 15`
+   - nmap: `nmap -sV -T4 {target_ip_range} -oJ /tmp/nmap.json`
+   - SubGHz: `python3 scripts/hardware/subghz_scan.py --range 300-900 --duration 20`
+   - WiFi: `python3 scripts/hardware/wifi_scan.py`
+2. Merge all results into findings/surfaces.json
+3. Each surface needs: protocol, identifier, signal_strength/port, details
+
+Only use tools that match available hardware (check findings/target.json).
+
+When findings/surfaces.json is complete, output <promise>RECON_COMPLETE</promise>
+```
+
+### bellum-research
+
+```yaml
+name: bellum-research
+description: OSINT and vulnerability research agent
+model: anthropic/claude-sonnet  # strong reasoning for research synthesis
+tools:
+  - Bash                   # for cve_search.py, shodan_search.py, github_search.py
+  - Task                   # parallel research per surface
+  - WebSearch              # direct OSINT
+  - WebFetch               # read vuln pages, docs, teardowns
+  - Read
+  - Write
+  - TodoWrite
+```
+
+**System prompt:**
+```
+You are a vulnerability researcher for an autonomous cyber-physical security evaluation.
+
+Read findings/surfaces.json for discovered attack surfaces.
+Read findings/intel.json if it exists (continuing from previous iteration).
+
+Your mission: for each surface, find known vulnerabilities, existing exploits,
+documentation, and teardowns. Form ranked attack hypotheses.
+
+STRATEGY:
+1. Launch parallel research using Task tool — one subagent per surface:
+   - Each subagent should: WebSearch for vulns, run cve_search.py, run github_search.py,
+     run shodan_search.py (if IP-based surface), WebFetch relevant pages
+2. Merge all research into findings/intel.json
+3. Rank hypotheses by likelihood of exploitation success
+
+When findings/intel.json is complete with ranked hypotheses,
+output <promise>RESEARCH_COMPLETE</promise>
+```
+
+### bellum-enumerate
+
+```yaml
+name: bellum-enumerate
+description: Deep enumeration agent — confirms hypotheses, extracts attack params
+model: anthropic/claude-sonnet  # needs to reason about protocols
+tools:
+  - Bash                   # for ble_enumerate.py, ble_read.py, curl, ssh
+  - Read
+  - Write
+  - WebSearch              # for protocol documentation
+  - WebFetch
+  - TodoWrite
+  # NOTE: no Task tool — enumeration is sequential per hypothesis
+  # to avoid BLE/hardware conflicts from parallel connections
+```
+
+**System prompt:**
+```
+You are an enumeration specialist for an autonomous cyber-physical security evaluation.
+
+Read findings/surfaces.json, findings/intel.json, and findings/vectors.json (if exists).
+
+Your mission: test each hypothesis from intel.json against the actual target.
+Confirm or reject. For confirmed hypotheses, extract EXACT attack parameters.
+
+PROCESS (sequential, NOT parallel — avoid hardware conflicts):
+1. Take the highest-ranked untested hypothesis
+2. Interact with the target surface (BLE enumerate, HTTP probe, SSH attempt, etc.)
+3. Confirm or reject the hypothesis
+4. If confirmed: record exact parameters (UUIDs, endpoints, payload format, etc.)
+5. If rejected: record why
+6. Move to next hypothesis
+
+Write results to findings/vectors.json.
+
+When all hypotheses are tested, output <promise>ENUM_COMPLETE</promise>
+```
+
+### bellum-exploit
+
+```yaml
+name: bellum-exploit
+description: Exploit development and execution agent
+model: anthropic/claude-sonnet  # strongest reasoning for exploit crafting
+tools:
+  - Bash                   # for ble_write.py, subghz_replay.py, curl, custom scripts
+  - Read
+  - Write
+  - WebSearch              # for reference exploit code
+  - WebFetch
+  - TodoWrite
+```
+
+**System prompt:**
+```
+You are an exploit developer for an autonomous cyber-physical security evaluation.
+
+Read findings/vectors.json for the confirmed attack vector you are targeting.
+Read findings/intel.json for supporting research.
+Read findings/exploit_{vector_id}.json if it exists (continuing from previous iteration).
+
+Your mission: craft and execute a proof-of-concept exploit that demonstrates
+real-world impact on the target.
+
+PROCESS:
+1. Study the vector parameters and research intel
+2. Search for reference exploit code if needed (WebSearch)
+3. Craft the exploit payload
+4. Execute it via the appropriate tool:
+   - BLE: python3 scripts/hardware/ble_write.py {mac} {char_uuid} {payload}
+   - SubGHz: python3 scripts/hardware/subghz_replay.py {capture_file}
+   - HTTP: curl -X POST {endpoint} -d '{payload}'
+   - SSH: python3 scripts/hardware/ssh_connect.py {host} {user} {pass}
+5. Observe the result — did the target respond? Was there visible impact?
+6. Document everything in findings/exploit_{vector_id}.json
+7. If first attempt failed: analyze why, adjust payload, try again
+
+Write results to findings/exploit_{vector_id}.json including:
+- payload_sent, result, impact (describe physical/observable effect), evidence
+
+When you have demonstrated impact OR exhausted approaches,
+output <promise>EXPLOIT_COMPLETE</promise>
+```
+
+### bellum-report
+
+```yaml
+name: bellum-report
+description: Pentest report generation agent
+model: kimi/k2.5          # fast, just needs to write well
+tools:
+  - Read                   # read all findings
+  - Write                  # write report
+  - Glob                   # find all findings files
+  - TodoWrite
+  # NOTE: no Bash, no WebSearch, no hardware tools — report only
+```
+
+**System prompt:**
+```
+You are a penetration test report writer.
+
+Read ALL files in the findings/ directory:
+- findings/target.json
+- findings/surfaces.json
+- findings/intel.json
+- findings/vectors.json
+- findings/exploit_*.json
+
+Generate a professional adversarial evaluation report.
+
+{report_template}
+
+Write to reports/bellum-{engagement_id}.md.
+
+When the report is complete, output <promise>REPORT_COMPLETE</promise>
 ```
 
 ---
 
 ## The Orchestrator (Our Fork Code)
 
-This is the code we add to OpenCode. It runs **outside** the LLM — it's deterministic control flow that calls the LLM inside ralph loops.
-
-```python
-# pseudocode — actual implementation is TypeScript in the OpenCode fork
-
-async def run_engagement(target_spec: str):
-    state = EngagementState(target=target_spec)
-
-    # PHASE 0: Target acquisition (single-shot, no loop)
-    state.hardware = await verify_hardware()
-    state.scope = await parse_target(target_spec)
-    checkpoint(state, "phase0")
-
-    # PHASE 1: Reconnaissance (ralph loop)
-    state.surfaces = await ralph_loop(
-        agent="bellum-recon",
-        prompt=RECON_PROMPT.format(target=state.scope, hardware=state.hardware),
-        completion_promise="RECON_COMPLETE",
-        max_iterations=10,
-        backpressure_gate=lambda output: len(output.get("surfaces", [])) >= 1,
-        output_file="findings/surfaces.json",
-    )
-    checkpoint(state, "phase1")
-
-    if not state.surfaces:
-        return await run_report(state, partial=True, reason="no surfaces found")
-
-    # PHASE 2: Research (ralph loop with parallel subagents inside)
-    state.intel = await ralph_loop(
-        agent="bellum-research",
-        prompt=RESEARCH_PROMPT.format(surfaces=state.surfaces),
-        completion_promise="RESEARCH_COMPLETE",
-        max_iterations=15,
-        backpressure_gate=lambda output: len(output.get("hypotheses", [])) >= 1,
-        output_file="findings/intel.json",
-    )
-    checkpoint(state, "phase2")
-
-    if not state.intel.get("hypotheses"):
-        return await run_report(state, partial=True, reason="no hypotheses formed")
-
-    # PHASE 3: Enumeration (ralph loop)
-    state.vectors = await ralph_loop(
-        agent="bellum-enumerate",
-        prompt=ENUM_PROMPT.format(surfaces=state.surfaces, intel=state.intel),
-        completion_promise="ENUM_COMPLETE",
-        max_iterations=10,
-        backpressure_gate=lambda output: len(output.get("vectors", [])) >= 1,
-        output_file="findings/vectors.json",
-    )
-    checkpoint(state, "phase3")
-
-    if not state.vectors:
-        return await run_report(state, partial=True, reason="no vectors confirmed")
-
-    # PHASE 4+5: Exploitation + Pivot loop
-    for vector in state.vectors:
-        result = await ralph_loop(
-            agent="bellum-exploit",
-            prompt=EXPLOIT_PROMPT.format(vector=vector, intel=state.intel),
-            completion_promise="EXPLOIT_COMPLETE",
-            max_iterations=8,
-            hitl_gate=True,  # MUST approve before execution
-            backpressure_gate=lambda output: output.get("impact") is not None,
-            output_file=f"findings/exploit_{vector['id']}.json",
-        )
-        if result.get("success"):
-            state.exploit_results.append(result)
-            break  # got a win, move to report
-        else:
-            state.failed_vectors.append(vector)
-            continue  # PIVOT: try next vector
-
-    # PHASE 6: Report (ralph loop)
-    report = await ralph_loop(
-        agent="bellum-report",
-        prompt=REPORT_PROMPT.format(state=state),
-        completion_promise="REPORT_COMPLETE",
-        max_iterations=3,
-        output_file=f"reports/bellum-{state.engagement_id}.md",
-    )
-
-    return report
-```
-
-**This is ~50 lines of deterministic control flow.** The LLM does the hard work inside each ralph loop. The orchestrator just sequences the phases, validates output, and handles pivot logic.
-
----
-
-## Ralph Loop Mechanics
-
-Each phase runs as a ralph loop. Here's how it works:
-
-```
-ralph_loop(agent, prompt, completion_promise, max_iterations, backpressure_gate)
-│
-├── Iteration 1:
-│   ├── Feed prompt to agent
-│   ├── Agent uses tools (Bash, WebSearch, ble_scan, etc.)
-│   ├── Agent writes findings to output_file
-│   ├── Agent outputs "RECON_COMPLETE" (or not)
-│   └── Stop hook intercepts exit
-│       ├── Check: did agent output completion_promise? → YES → exit loop
-│       ├── Check: does output_file pass backpressure_gate? → YES → exit loop
-│       ├── Check: iteration >= max_iterations? → YES → exit loop (partial)
-│       └── NO to all → re-feed same prompt, agent sees its previous work in files
-│
-├── Iteration 2:
-│   ├── Agent reads its own previous output from files
-│   ├── Agent sees what it already did (git diff / file state)
-│   ├── Agent continues where it left off or tries different approach
-│   └── Stop hook checks again...
-│
-└── ... until exit condition met
-```
-
-**Why this is better than v1's LLM-managed state:**
-1. The LLM can't forget the state machine rules — they're enforced externally
-2. The LLM can't loop forever — max_iterations is a hard cap
-3. The LLM can't skip validation — backpressure_gate blocks progression
-4. Fresh context each iteration — no context window blowout
-5. File-based memory — findings persist between iterations via disk, not token context
-
----
-
-## Phase Definitions
-
-### Phase 0: Target Acquisition (Single-Shot)
-
-**Not a ralph loop** — this is deterministic code that runs once.
-
 ```typescript
-// In the orchestrator (our fork code)
-async function acquireTarget(spec: string): Promise<EngagementState> {
-    const hardware = {
-        flipper: await checkSerial("/dev/ttyACM0"),
-        ble: await checkBleAdapter(),
-        wifi: await checkWifiMonitor(),
-    };
+// packages/opencode/src/bellum/orchestrator.ts
 
-    return {
-        engagement_id: `bellum-${Date.now()}`,
-        target: spec,
+import { spawnAgent, readJson, writeJson, checkHardware } from "./util";
+import { validateSurfaces, validateIntel, validateVectors, validateExploit, validateReport } from "./gates";
+
+interface BellumConfig {
+    target: string;
+    maxReconIter: number;     // default 10
+    maxResearchIter: number;  // default 15
+    maxEnumIter: number;      // default 10
+    maxExploitIter: number;   // default 8
+    maxReportIter: number;    // default 3
+    hitl: boolean;            // default false (yolo)
+}
+
+export async function runEngagement(config: BellumConfig) {
+    const engagementId = `bellum-${Date.now()}`;
+
+    // PHASE 0: Target acquisition (no LLM)
+    const hardware = await checkHardware();
+    await writeJson("findings/target.json", {
+        engagement_id: engagementId,
+        target: config.target,
         hardware,
-        available_tools: deriveToolset(hardware), // only enable tools for connected hardware
-    };
+        available_tools: deriveToolset(hardware),
+    });
+
+    // PHASE 1: Recon
+    await spawnAgent({
+        agent: "bellum-recon",
+        maxIterations: config.maxReconIter,
+        completionPromise: "RECON_COMPLETE",
+    });
+    if (!validateSurfaces("findings/surfaces.json")) {
+        return await runReport(engagementId, "No attack surfaces discovered");
+    }
+
+    // PHASE 2: Research
+    await spawnAgent({
+        agent: "bellum-research",
+        maxIterations: config.maxResearchIter,
+        completionPromise: "RESEARCH_COMPLETE",
+    });
+    if (!validateIntel("findings/intel.json")) {
+        return await runReport(engagementId, "No attack hypotheses formed");
+    }
+
+    // PHASE 3: Enumeration
+    await spawnAgent({
+        agent: "bellum-enumerate",
+        maxIterations: config.maxEnumIter,
+        completionPromise: "ENUM_COMPLETE",
+    });
+    if (!validateVectors("findings/vectors.json")) {
+        return await runReport(engagementId, "No exploitable vectors confirmed");
+    }
+
+    // PHASE 4+5: Exploit + Pivot
+    const vectors = await readJson("findings/vectors.json");
+    let exploitSuccess = false;
+
+    for (const vector of vectors.vector_priority) {
+        await spawnAgent({
+            agent: "bellum-exploit",
+            maxIterations: config.maxExploitIter,
+            completionPromise: "EXPLOIT_COMPLETE",
+            env: { CURRENT_VECTOR: vector, BELLUM_HITL: String(config.hitl) },
+        });
+
+        if (validateExploit(`findings/exploit_${vector}.json`)) {
+            exploitSuccess = true;
+            break;  // THE PIVOT: for loop IS the pivot logic
+        }
+        // else: continue to next vector automatically
+    }
+
+    // PHASE 6: Report
+    await runReport(engagementId, exploitSuccess ? "Exploitation successful" : "All vectors attempted");
+}
+
+async function runReport(engagementId: string, summary: string) {
+    await writeJson("findings/summary.json", { engagementId, summary });
+    await spawnAgent({
+        agent: "bellum-report",
+        maxIterations: 3,
+        completionPromise: "REPORT_COMPLETE",
+    });
 }
 ```
 
-**Output:** `findings/target.json` — hardware inventory + scope
+**That's it.** ~80 lines. The orchestrator:
+1. Checks hardware (deterministic)
+2. Spawns phase agents in sequence (each is a ralph loop)
+3. Validates output between phases (backpressure gates)
+4. Loops over vectors for exploit/pivot (deterministic for loop)
+5. Always generates a report, even on partial completion
 
 ---
 
-### Phase 1: Reconnaissance (Ralph Loop)
+## Backpressure Gates
 
-**Agent:** `bellum-recon` (fast model — Kimi K2.5 or MiniMax M2.5)
+Simple validation functions. No LLM involved.
 
-**Prompt:**
-```
-You are a reconnaissance agent for a cyber-physical security evaluation.
-
-TARGET: {target_spec}
-HARDWARE AVAILABLE: {hardware_inventory}
-PREVIOUS FINDINGS: Read findings/surfaces.json if it exists.
-
-Your mission: discover ALL wireless and network attack surfaces the target
-exposes. Cast a wide net — BLE, WiFi, network ports, Sub-GHz RF.
-
-Available tools:
-- Bash: run `python3 scripts/ble_scan.py`, `nmap`, `python3 scripts/wifi_scan.py`
-- WebSearch: look up the target model/brand if you can identify it
-- Read/Write: read previous findings, write updated findings
-
-For each discovered surface, record: protocol, identifier, signal strength, details.
-
-Write your findings to findings/surfaces.json in this format:
-{surfaces_schema}
-
-When you have run all available scanners and documented all surfaces,
-output <promise>RECON_COMPLETE</promise>
-```
-
-**Subagent parallelism within this phase:**
-```
-bellum-recon (parent)
-├── Task("Scan BLE devices for 15 seconds") → runs ble_scan.py via Bash
-├── Task("Run nmap -sV against 192.168.0.0/24") → runs nmap via Bash
-└── Task("Scan Sub-GHz 300-900MHz for 20s") → runs subghz_scan.py via Bash
-    (all three run in parallel via OpenCode's Task tool)
-```
-
-**Backpressure gate:** `surfaces.json` exists AND contains >= 1 surface
-**Max iterations:** 10
-**Checkpoint:** `checkpoints/phase1.json`
-
----
-
-### Phase 2: Research (Ralph Loop)
-
-**Agent:** `bellum-research` (strong reasoning model — Claude or Kimi K2.5)
-
-**Prompt:**
-```
-You are a vulnerability researcher for a cyber-physical security evaluation.
-
-DISCOVERED SURFACES: {read findings/surfaces.json}
-PREVIOUS RESEARCH: Read findings/intel.json if it exists.
-
-Your mission: for each attack surface, search for known vulnerabilities,
-existing exploits, documentation, and teardowns. Form attack hypotheses.
-
-Available tools:
-- WebSearch: search for "{device} {protocol} vulnerability 2025 2026"
-- WebFetch: read specific vulnerability pages, teardowns, documentation
-- Bash: run `python3 scripts/cve_search.py {product}`, `python3 scripts/shodan_search.py {query}`,
-         `python3 scripts/github_search.py {query}`, `python3 scripts/fcc_lookup.py {fcc_id}`
-- Read/Write: read surfaces, write intel
-
-For each surface, research and record findings + attack hypotheses.
-Rank hypotheses by likelihood of success.
-
-Write findings to findings/intel.json in this format:
-{intel_schema}
-
-When all surfaces have been researched, output <promise>RESEARCH_COMPLETE</promise>
-```
-
-**Subagent parallelism:**
-```
-bellum-research (parent)
-├── Task("Research BLE surface: {surface_1}") → WebSearch + cve_search + github_search
-├── Task("Research HTTP surface: {surface_2}") → WebSearch + WebFetch + shodan_search
-└── Task("Research SSH surface: {surface_3}") → WebSearch + cve_search
-    (one subagent per surface, all parallel)
-```
-
-**Backpressure gate:** `intel.json` exists AND contains >= 1 hypothesis
-**Max iterations:** 15
-**Checkpoint:** `checkpoints/phase2.json`
-
----
-
-### Phase 3: Enumeration (Ralph Loop)
-
-**Agent:** `bellum-enumerate` (strong model — needs to reason about protocols)
-
-**Prompt:**
-```
-You are an enumeration specialist for a cyber-physical security evaluation.
-
-SURFACES: {read findings/surfaces.json}
-INTEL: {read findings/intel.json}
-PREVIOUS VECTORS: Read findings/vectors.json if it exists.
-
-Your mission: deep-dive the top-ranked attack hypotheses. Interact with the
-target to confirm or reject each hypothesis. For confirmed hypotheses, extract
-the exact parameters needed for exploitation.
-
-Available tools:
-- Bash: run `python3 scripts/ble_enumerate.py {mac}`, `python3 scripts/ble_read.py {mac} {uuid}`,
-         `curl`, `ssh`, `python3 scripts/packet_analyze.py {pcap}`
-- Read/Write: read intel, write vectors
-
-For each hypothesis:
-1. Interact with the target surface
-2. Confirm or reject
-3. If confirmed: record exact attack parameters (UUIDs, endpoints, payloads)
-4. If rejected: record why and move to next
-
-Write findings to findings/vectors.json in this format:
-{vectors_schema}
-
-When all hypotheses have been tested, output <promise>ENUM_COMPLETE</promise>
-```
-
-**Backpressure gate:** `vectors.json` exists AND contains >= 1 confirmed vector
-**Max iterations:** 10
-**Checkpoint:** `checkpoints/phase3.json`
-
----
-
-### Phase 4: Exploitation (Ralph Loop + HITL Gate)
-
-**Agent:** `bellum-exploit` (strongest reasoning model available)
-
-**This phase has a HITL gate.** The orchestrator intercepts tool calls to dangerous tools (ble_write, subghz_replay, http POST to target, code_execute) and requires human approval via OpenCode's `permission.ask` hook before execution.
-
-**Prompt:**
-```
-You are an exploit developer for a cyber-physical security evaluation.
-
-VECTOR: {current_vector from vectors.json}
-INTEL: {relevant intel for this vector}
-PREVIOUS ATTEMPTS: Read findings/exploit_{vector_id}.json if it exists.
-
-Your mission: craft and execute a proof-of-concept exploit for this vector.
-Demonstrate actual impact on the target.
-
-Available tools:
-- Bash: run `python3 scripts/ble_write.py {mac} {uuid} {payload}`,
-         `python3 scripts/subghz_replay.py {file}`, `curl`, custom scripts
-- WebSearch: find reference exploit code
-- Read/Write: read vector details, write exploit results
-
-Process:
-1. Study the vector parameters
-2. Craft the exploit payload
-3. IMPORTANT: Before executing, clearly state what you will send and why
-4. Execute the exploit
-5. Observe and document the result
-6. If failed: analyze why, adjust, retry (you have multiple iterations)
-
-Write results to findings/exploit_{vector_id}.json in this format:
-{exploit_schema}
-
-When you have demonstrated impact OR exhausted approaches,
-output <promise>EXPLOIT_COMPLETE</promise>
-```
-
-**HITL enforcement (OpenCode plugin hook):**
 ```typescript
-// .opencode/plugins/hitl-gate.ts
-export default {
-    name: "bellum-hitl",
-    hooks: {
-        "tool.execute.before": async (ctx) => {
-            const dangerous = ["ble_write", "subghz_replay", "ir_replay",
-                               "badusb_execute"];
-            const cmd = ctx.tool.input?.command || "";
+// packages/opencode/src/bellum/gates.ts
 
-            // Check if Bash is running a dangerous script
-            if (ctx.tool.name === "Bash" &&
-                dangerous.some(d => cmd.includes(d))) {
-                return {
-                    action: "require_approval",
-                    message: `EXPLOIT EXECUTION: ${cmd}\nApprove?`
-                };
-            }
-        }
-    }
-};
-```
+export function validateSurfaces(path: string): boolean {
+    const data = readJsonSync(path);
+    return data?.surfaces?.length >= 1;
+}
 
-**Backpressure gate:** `exploit_{id}.json` exists AND `impact` field is non-null
-**Max iterations:** 8 per vector
-**Checkpoint:** `checkpoints/phase4_{vector_id}.json`
+export function validateIntel(path: string): boolean {
+    const data = readJsonSync(path);
+    return data?.hypotheses?.length >= 1;
+}
 
----
+export function validateVectors(path: string): boolean {
+    const data = readJsonSync(path);
+    return data?.vectors?.some((v: any) => v.confirmed === true);
+}
 
-### Phase 5: Pivot (Deterministic Code, Not a Loop)
+export function validateExploit(path: string): boolean {
+    const data = readJsonSync(path);
+    return data?.impact != null && data?.success === true;
+}
 
-**Not a ralph loop.** This is orchestrator logic:
-
-```python
-# In the orchestrator
-for vector in state.vectors:
-    result = await run_exploit_loop(vector)
-    if result.success:
-        state.successful_exploits.append(result)
-        break
-    else:
-        state.failed_vectors.append(vector)
-        # Continue to next vector (the for loop IS the pivot)
-
-# If no vectors succeeded but we haven't explored all surfaces:
-if not state.successful_exploits and unexplored_surfaces(state):
-    # Re-run recon with different parameters
-    state.surfaces = await ralph_loop(agent="bellum-recon", ...)
-    # Then re-run research, enum, exploit...
-```
-
-The for loop over vectors IS the pivot logic. No LLM decision needed.
-
----
-
-### Phase 6: Reporting (Ralph Loop)
-
-**Agent:** `bellum-report` (fast model — just needs to write well)
-
-**Prompt:**
-```
-You are a security report writer.
-
-Read ALL findings files in findings/ directory:
-- findings/target.json (target + hardware)
-- findings/surfaces.json (discovered attack surfaces)
-- findings/intel.json (vulnerability research)
-- findings/vectors.json (confirmed attack vectors)
-- findings/exploit_*.json (exploitation results)
-
-Generate a professional penetration test report.
-
-Write the report to reports/bellum-{engagement_id}.md using this structure:
-{report_template}
-
-Include severity ratings (CRITICAL/HIGH/MEDIUM/LOW), remediation
-recommendations, and an attack chain visualization.
-
-When the report is complete, output <promise>REPORT_COMPLETE</promise>
-```
-
-**Backpressure gate:** report file exists AND contains all required sections
-**Max iterations:** 3
-**Checkpoint:** `checkpoints/phase6.json`
-
----
-
-## Tool Architecture
-
-### What OpenCode Gives Us (Use Directly)
-
-| OpenCode Tool | How Bellum Uses It |
-|---------------|--------------------|
-| **Bash** | THE BRIDGE TO EVERYTHING. Runs Python scripts (Bleak, pyFlipper, Scapy), nmap, tshark, curl, ssh, binwalk. Every hardware tool is a Python script invoked via Bash. |
-| **WebSearch** | OSINT: search for device vulnerabilities, CVEs, teardowns, exploit code |
-| **WebFetch** | Read vulnerability pages, documentation, API docs, GitHub READMEs |
-| **Read** | Read findings files, captured data, configs, firmware dumps |
-| **Write** | Write findings JSON, exploit scripts, reports |
-| **Edit** | Modify exploit code between iterations |
-| **Grep** | Search through captured packet data, firmware strings, config files |
-| **Glob** | Find pcap files, firmware images, .sub files in the workspace |
-| **Task** | Spawn subagents for parallel recon/research within a phase |
-| **TodoWrite** | Track attack progress through phases (visible in TUI) |
-
-**We do NOT need custom OpenCode tools for:** web search, web fetch, file I/O, code execution, search, or subagent delegation. That's half the PRD's tool list — free.
-
-### What We Add (Python Scripts Called via Bash)
-
-These live in `scripts/` and are invoked by the agent via Bash:
-
-```
-scripts/
-├── hardware/
-│   ├── ble_scan.py          # Bleak: scan BLE devices, output JSON
-│   ├── ble_enumerate.py     # Bleak: full GATT enumeration, output JSON
-│   ├── ble_read.py          # Bleak: read characteristic, output value
-│   ├── ble_write.py         # Bleak: write characteristic (HITL gated)
-│   ├── ble_subscribe.py     # Bleak: subscribe to notifications, output stream
-│   ├── flipper_serial.py    # pyFlipper: generic serial command interface
-│   ├── subghz_scan.py       # pyFlipper: Sub-GHz scanner, output JSON
-│   ├── subghz_capture.py    # pyFlipper: capture signal to .sub file
-│   ├── subghz_replay.py     # pyFlipper: replay .sub file (HITL gated)
-│   ├── ir_capture.py        # pyFlipper: capture IR signal
-│   ├── ir_replay.py         # pyFlipper: replay IR signal (HITL gated)
-│   └── wifi_scan.py         # scapy/iwlist: scan WiFi networks, output JSON
-├── recon/
-│   ├── cve_search.py        # NVD API: search CVEs by product/version
-│   ├── shodan_search.py     # Shodan API: search/host lookup
-│   ├── github_search.py     # GitHub API: search repos/code/issues
-│   └── fcc_lookup.py        # FCC API: lookup device RF specs
-└── util/
-    ├── packet_analyze.py    # pyshark: analyze pcap file, output summary
-    └── firmware_analyze.py  # binwalk: extract/analyze firmware binary
-```
-
-**Every script follows the same contract:**
-- Takes arguments from CLI: `python3 scripts/ble_scan.py --duration 10 --output json`
-- Outputs structured JSON to stdout
-- Returns exit code 0 on success, non-zero on failure
-- Stderr for error messages
-
-**The agent calls them via Bash:**
-```
-Bash: python3 scripts/hardware/ble_scan.py --duration 15
-```
-
-No TypeScript tool wrappers. No MCP servers for basic tools. Just Python scripts called via Bash. The agent can also write and run ad-hoc Python scripts via Bash for novel exploit development — it's not limited to our pre-built scripts.
-
-### MCP Servers (For Complex Stateful Integrations)
-
-Some tools need persistent connections or stateful sessions. These are MCP servers:
-
-```json
-// opencode.json
-{
-    "mcp": {
-        "flipper-zero": {
-            "type": "local",
-            "command": ["python3", "mcp_servers/flipper_mcp.py"],
-            "enabled": true,
-            "environment": {
-                "FLIPPER_PORT": "/dev/ttyACM0"
-            }
-        }
-    }
+export function validateReport(path: string): boolean {
+    const content = readFileSync(path, "utf-8");
+    return content.includes("## Executive Summary") &&
+           content.includes("## Findings") &&
+           content.includes("## Recommendations");
 }
 ```
 
-Use MCP when:
-- The tool needs a persistent serial connection (Flipper Zero)
-- The tool has complex multi-step state (BLE connection that must stay alive across multiple reads/writes)
-
-Use Bash scripts when:
-- The tool is stateless (scan, search, one-shot read/write)
-- The tool is a CLI wrapper (nmap, tshark, binwalk)
-
 ---
 
-## Subagent Orchestration
+## Recovery (Plugin Hooks, Not a Phase)
 
-### Within-Phase Parallelism
-
-Inside a ralph loop iteration, the agent can spawn parallel subagents via the Task tool. This is OpenCode's native capability — we don't need to modify it.
-
-**Recon phase — parallel scanning:**
-```
-bellum-recon iteration 1:
-  "I need to scan BLE, WiFi, and network simultaneously."
-  ├── Task("Run BLE scan for 15 seconds")
-  │   └── Bash: python3 scripts/hardware/ble_scan.py --duration 15
-  ├── Task("Run nmap against 192.168.0.0/24")
-  │   └── Bash: nmap -sV 192.168.0.0/24
-  └── Task("Run Sub-GHz scan 300-900MHz")
-      └── Bash: python3 scripts/hardware/subghz_scan.py --range 300-900
-
-  All three return results → agent merges into surfaces.json
-```
-
-**Research phase — parallel OSINT per surface:**
-```
-bellum-research iteration 1:
-  "I need to research 3 surfaces in parallel."
-  ├── Task("Research BLE:QUADRUPED-XX vulnerability and exploits")
-  │   └── WebSearch + WebFetch + cve_search + github_search
-  ├── Task("Research HTTP:192.168.4.1:8080 vulnerability")
-  │   └── WebSearch + WebFetch + shodan_search
-  └── Task("Research SSH:192.168.4.1:22 default credentials")
-      └── WebSearch + cve_search
-
-  All three return intel → agent merges into intel.json
-```
-
-### Across-Phase Orchestration
-
-The orchestrator (our fork code) handles phase sequencing. Each phase is a ralph loop. Output files are the interface between phases.
-
-```
-Phase 1 (recon) writes → findings/surfaces.json
-                              ↓ (read by)
-Phase 2 (research) writes → findings/intel.json
-                              ↓ (read by)
-Phase 3 (enum) writes → findings/vectors.json
-                              ↓ (read by)
-Phase 4 (exploit) writes → findings/exploit_V1.json
-                              ↓ (read by)
-Phase 6 (report) writes → reports/bellum-{id}.md
-```
-
-**Files are the shared memory.** No token context carries between phases. Each phase starts fresh and reads what it needs from disk. This is the ralph loop's superpower — infinite effective context via filesystem.
-
----
-
-## Recovery Architecture
-
-### Per-Iteration Recovery (Inside Ralph Loop)
-
-The ralph loop handles this automatically:
-- If the agent crashes mid-iteration → loop restarts with same prompt, agent reads files from disk
-- If the agent gets stuck → max_iterations cap kills the loop, orchestrator moves to next phase
-- If a tool fails → agent sees the error in next iteration, tries different approach
-
-### Hardware Recovery (Plugin Hook)
+Recovery is NOT a state. It's **inline plugin hooks** that fire when tools fail.
 
 ```typescript
 // .opencode/plugins/hardware-recovery.ts
 export default {
-    name: "bellum-hardware-recovery",
+    name: "hardware-recovery",
     hooks: {
         "tool.execute.after": async (ctx) => {
-            if (ctx.result?.error?.includes("serial") ||
-                ctx.result?.error?.includes("ConnectionError") ||
-                ctx.result?.error?.includes("BLEError")) {
+            const err = ctx.result?.stderr || "";
 
-                // Attempt hardware reconnection
-                const recovered = await reconnectHardware(ctx);
-                if (!recovered) {
-                    // Write hardware status to disk so next iteration sees it
-                    await writeFile("findings/hardware_status.json", {
-                        [deviceType]: "disconnected",
+            // Serial disconnection
+            if (err.includes("SerialException") || err.includes("could not open port")) {
+                console.log("[RECOVERY] Flipper disconnected. Attempting reconnection...");
+                const reconnected = await retry(() =>
+                    exec("python3 scripts/hardware/flipper_serial.py --ping"),
+                    { attempts: 3, backoff: 2000 }
+                );
+                if (!reconnected) {
+                    // Update hardware status so agent knows to skip Flipper tools
+                    await writeJson("findings/hardware_status.json", {
+                        flipper: "disconnected",
                         timestamp: Date.now()
                     });
                 }
+            }
+
+            // BLE connection failure
+            if (err.includes("BleakError") || err.includes("ConnectionError")) {
+                console.log("[RECOVERY] BLE connection failed. Retrying...");
+                await exec("sudo hciconfig hci0 reset");
             }
         }
     }
 };
 ```
 
-### Backpressure Gate Failures
+```typescript
+// .opencode/plugins/stuck-detection.ts
+let lastToolCall = "";
+let repeatCount = 0;
 
-If a phase hits max_iterations without passing the backpressure gate:
+export default {
+    name: "stuck-detection",
+    hooks: {
+        "tool.execute.before": async (ctx) => {
+            const sig = JSON.stringify({ tool: ctx.tool.name, input: ctx.tool.input });
+            if (sig === lastToolCall) {
+                repeatCount++;
+                if (repeatCount >= 3) {
+                    // Force the agent to try something different
+                    return {
+                        action: "modify",
+                        message: "WARNING: You have repeated the same tool call 3 times. " +
+                                "Try a DIFFERENT approach or output your completion promise."
+                    };
+                }
+            } else {
+                lastToolCall = sig;
+                repeatCount = 0;
+            }
+        }
+    }
+};
+```
+
+```typescript
+// .opencode/plugins/audit-log.ts
+export default {
+    name: "audit-log",
+    hooks: {
+        "tool.execute.before": async (ctx) => {
+            const entry = {
+                timestamp: new Date().toISOString(),
+                agent: ctx.agent?.name,
+                tool: ctx.tool.name,
+                input: ctx.tool.input,
+            };
+            appendFileSync("findings/audit_log.jsonl", JSON.stringify(entry) + "\n");
+        },
+        "tool.execute.after": async (ctx) => {
+            const entry = {
+                timestamp: new Date().toISOString(),
+                agent: ctx.agent?.name,
+                tool: ctx.tool.name,
+                success: !ctx.result?.error,
+                output_preview: (ctx.result?.stdout || "").slice(0, 200),
+            };
+            appendFileSync("findings/audit_log.jsonl", JSON.stringify(entry) + "\n");
+        }
+    }
+};
+```
+
+---
+
+## Context Window Strategy
+
+**Ralph loops solve context blowout.** Each iteration starts with a fresh context window. The agent reads its own previous work from files.
+
+But within a single iteration, an agent might make many tool calls. Here's how we manage it:
+
+| Tool | Typical Output Size | Strategy |
+|------|-------------------|----------|
+| ble_scan.py | ~500 tokens | Fine as-is |
+| nmap (full /24) | ~3000 tokens | Script outputs JSON summary, not raw nmap |
+| WebSearch | ~1000 tokens | Fine as-is |
+| WebFetch | ~3000 tokens | Agent reads via WebFetch which already truncates |
+| ble_enumerate.py | ~1500 tokens | Script outputs structured JSON only |
+| packet_analyze.py | ~2000 tokens | Script outputs summary, not raw pcap |
+
+**Key rule:** All Python scripts in `scripts/` output **structured JSON summaries**, not raw tool output. The script does the parsing; the LLM gets clean data.
 
 ```python
-# In the orchestrator
-result = await ralph_loop(agent="bellum-recon", ...)
-
-if not backpressure_gate(result):
-    # Phase failed to produce valid output
-    if phase == "recon" and no_surfaces:
-        # Can't continue — nothing to research
-        return await run_report(state, partial=True, reason="no surfaces found")
-    elif phase == "research" and no_hypotheses:
-        # Re-run recon with broader parameters?
-        state.recon_params.broaden()
-        continue  # re-enter recon loop
-    elif phase == "exploit" and current_vector_failed:
-        # Try next vector (pivot)
-        continue  # for loop advances to next vector
+# Example: scripts/hardware/ble_scan.py outputs:
+{
+    "scan_duration": 15,
+    "devices_found": 3,
+    "devices": [
+        {"name": "QUADRUPED-XX", "mac": "AA:BB:CC:DD:EE:FF", "rssi": -42, "connectable": true},
+        {"name": "Unknown", "mac": "11:22:33:44:55:66", "rssi": -78, "connectable": false},
+        {"name": "SmartBulb", "mac": "77:88:99:AA:BB:CC", "rssi": -65, "connectable": true}
+    ]
+}
+# NOT raw Bleak output with hex dumps and advertisement data
 ```
+
+Between ralph loop iterations, the agent's previous context is discarded. It reads from `findings/*.json` to pick up where it left off. This means:
+- **Iteration 1:** 0 tokens of history. Runs scans, writes findings.
+- **Iteration 2:** 0 tokens of history. Reads findings from disk. Sees what's missing. Fills gaps.
+- **Iteration 3:** 0 tokens of history. Reads findings from disk. Everything complete. Outputs promise.
+
+Effective context per iteration: ~10K tokens (prompt + tool outputs). Max context never exceeded.
 
 ---
 
-## What We Fork in OpenCode
-
-Minimal changes to OpenCode's codebase. We add, not modify:
-
-### 1. Bellum Orchestrator (`packages/opencode/src/bellum/`)
-
-```
-packages/opencode/src/bellum/
-├── orchestrator.ts     # Phase sequencing, ralph loop runner
-├── state.ts            # EngagementState type definitions
-├── gates.ts            # Backpressure gate validators
-├── checkpoints.ts      # Checkpoint save/load
-└── prompts/
-    ├── recon.md        # Phase 1 prompt template
-    ├── research.md     # Phase 2 prompt template
-    ├── enumerate.md    # Phase 3 prompt template
-    ├── exploit.md      # Phase 4 prompt template
-    └── report.md       # Phase 6 prompt template
-```
-
-### 2. Ralph Loop Runner (`packages/opencode/src/bellum/ralph.ts`)
-
-Implements the ralph loop pattern inside OpenCode:
-- Feed prompt to agent
-- Stop hook blocks exit
-- Check completion promise / backpressure gate
-- Re-feed or exit
-
-### 3. CLI Entry Point
-
-```bash
-# Instead of `opencode "prompt"`, we add:
-bellum "Attack that quadruped robot"
-# This invokes the orchestrator, which runs the phases
-```
-
-### 4. Skills (`.opencode/skills/`)
-
-Loaded on-demand by agents within phases:
-
-```
-.opencode/skills/
-├── ble-recon/SKILL.md        # How to run BLE reconnaissance
-├── ble-exploit/SKILL.md      # How to exploit BLE GATT vulnerabilities
-├── rf-replay/SKILL.md        # How to capture and replay Sub-GHz signals
-├── network-recon/SKILL.md    # How to run network recon (nmap, Shodan)
-├── osint/SKILL.md            # How to research a device (web, GitHub, CVE)
-└── report-writing/SKILL.md   # How to write a pentest report
-```
-
-### 5. Plugins (`.opencode/plugins/`)
-
-```
-.opencode/plugins/
-├── hitl-gate.ts              # Block dangerous tool execution without approval
-├── hardware-recovery.ts      # Auto-reconnect on hardware failures
-├── audit-log.ts              # Log every tool call for the engagement record
-└── stuck-detection.ts        # Detect repeated identical tool calls
-```
-
----
-
-## Example Trace (v2 — with ralph loops and subagents)
+## Example Trace (v3 — yolo mode, full auto)
 
 ```
 $ bellum "Attack that quadruped robot on table 3"
 
 [ORCHESTRATOR] Phase 0: Target Acquisition
-  → Flipper Zero on /dev/ttyACM0 ✓
-  → BLE adapter (native) ✓
-  → WiFi monitor mode ✗
-  → Scope: BLE/WiFi/SubGHz within 10m
-  → findings/target.json written
+  Hardware: Flipper ✓ | BLE ✓ | WiFi (no monitor) ✗
+  → findings/target.json
 
-[ORCHESTRATOR] Phase 1: Reconnaissance → ralph_loop(bellum-recon, max=10)
-  [RALPH ITER 1]
-    bellum-recon: "Scanning all available protocols in parallel."
-    ├── Task("BLE scan 15s") → 3 devices, QUADRUPED-XX at -42dBm
+[ORCHESTRATOR] Phase 1: Recon → spawning bellum-recon
+  [RALPH bellum-recon ITER 1]
+    "Launching parallel scans."
+    ├── Task("BLE scan 15s")    → 3 devices found
     ├── Task("nmap 192.168.4.0/24") → 1 host, ports 22/8080/9090
-    └── Task("SubGHz scan 300-900MHz") → no signals
-    bellum-recon: Wrote findings/surfaces.json (3 surfaces)
-    bellum-recon: <promise>RECON_COMPLETE</promise>
-  [RALPH] Gate passed: 3 surfaces found. Exiting loop.
-  → Checkpoint: checkpoints/phase1.json
+    ├── Task("SubGHz 300-900MHz")   → no signals
+    └── Task("WiFi scan")          → "RobotAP-5G" found
+    Merged → findings/surfaces.json (3 surfaces)
+    <promise>RECON_COMPLETE</promise>
+  [GATE] surfaces.json: 3 surfaces ✓
 
-[ORCHESTRATOR] Phase 2: Research → ralph_loop(bellum-research, max=15)
-  [RALPH ITER 1]
-    bellum-research: "Researching 3 surfaces in parallel."
-    ├── Task("Research BLE:QUADRUPED") → CVE found, existing Bleak PoC on GitHub
-    ├── Task("Research HTTP:8080") → API docs found, no auth
-    └── Task("Research SSH:22") → default creds common for this brand
-    bellum-research: Wrote findings/intel.json (3 hypotheses)
-    bellum-research: <promise>RESEARCH_COMPLETE</promise>
-  [RALPH] Gate passed: 3 hypotheses. Exiting loop.
-  → Checkpoint: checkpoints/phase2.json
+[ORCHESTRATOR] Phase 2: Research → spawning bellum-research
+  [RALPH bellum-research ITER 1]
+    "Researching 3 surfaces in parallel."
+    ├── Task("Research BLE:QUADRUPED-XX")
+    │   └── WebSearch + cve_search + github_search → CVE found, PoC on GitHub
+    ├── Task("Research HTTP:192.168.4.1:8080")
+    │   └── WebSearch + shodan + WebFetch → API docs, no auth
+    └── Task("Research SSH:192.168.4.1:22")
+        └── WebSearch + cve_search → default creds common
+    Merged → findings/intel.json (3 hypotheses, ranked [H1, H3, H2])
+    <promise>RESEARCH_COMPLETE</promise>
+  [GATE] intel.json: 3 hypotheses ✓
 
-[ORCHESTRATOR] Phase 3: Enumeration → ralph_loop(bellum-enumerate, max=10)
-  [RALPH ITER 1]
-    bellum-enumerate: "Deep-diving H1: BLE GATT write."
+[ORCHESTRATOR] Phase 3: Enumeration → spawning bellum-enumerate
+  [RALPH bellum-enumerate ITER 1]
+    Testing H1: BLE GATT write
     → Bash: python3 scripts/hardware/ble_enumerate.py AA:BB:CC:DD:EE:FF
-    → Found: service 0xFFE0, char 0xFFE1 (write, notify), no auth
-    → Bash: python3 scripts/hardware/ble_read.py AA:BB:CC:DD:EE:FF 0xFFE1
-    → Current value: 0x00 (idle)
-    bellum-enumerate: H1 CONFIRMED. Exact params recorded.
-  [RALPH ITER 2]
-    bellum-enumerate: "Deep-diving H3: REST API."
-    → Bash: curl http://192.168.4.1:8080/api/
-    → Endpoint list, no auth. /api/cmd accepts POST.
-    bellum-enumerate: H3 CONFIRMED. Wrote findings/vectors.json
-    bellum-enumerate: <promise>ENUM_COMPLETE</promise>
-  [RALPH] Gate passed: 2 confirmed vectors. Exiting loop.
-  → Checkpoint: checkpoints/phase3.json
+    → Char 0xFFE1: writable, no auth required
+    → CONFIRMED ✓
+    Testing H3: REST API
+    → Bash: curl -s http://192.168.4.1:8080/api/cmd -X POST -d '{"test":true}'
+    → 200 OK, command accepted
+    → CONFIRMED ✓
+    → findings/vectors.json (V1: BLE write, V2: REST API)
+    <promise>ENUM_COMPLETE</promise>
+  [GATE] vectors.json: 2 confirmed vectors ✓
 
-[ORCHESTRATOR] Phase 4: Exploitation → vector V1
-  → ralph_loop(bellum-exploit, max=8, hitl_gate=true)
-  [RALPH ITER 1]
-    bellum-exploit: "Crafting BLE write payload for movement control."
-    → WebSearch: "BLE GATT write movement command Bleak example"
-    → Payload: 0x01 0x02 0x00 0x32 (move forward, speed 50)
+[ORCHESTRATOR] Phase 4: Exploit → vector V1 (BLE write)
+  [RALPH bellum-exploit ITER 1]
+    Crafting BLE payload for movement control.
+    → WebSearch: "BLE GATT write Bleak movement command"
     → Bash: python3 scripts/hardware/ble_write.py AA:BB:CC:DD:EE:FF 0xFFE1 01020032
-    *** HITL GATE: Approve BLE write to 0xFFE1 (move robot forward)? ***
-    → USER: approved ✓
-    → EXECUTED: robot moves forward!
+      ↑ YOLO: auto-approved, fires immediately
+    → Robot moves forward ✓
     → Bash: python3 scripts/hardware/ble_write.py AA:BB:CC:DD:EE:FF 0xFFE1 00000000
-    *** HITL GATE: Approve BLE write to 0xFFE1 (emergency stop)? ***
-    → USER: approved ✓
-    → EXECUTED: robot stops.
-    bellum-exploit: Wrote findings/exploit_V1.json
-    bellum-exploit: <promise>EXPLOIT_COMPLETE</promise>
-  [RALPH] Gate passed: impact confirmed. Exiting loop.
-  → Checkpoint: checkpoints/phase4_V1.json
+    → Robot stops ✓
+    → findings/exploit_V1.json (impact: "full movement control")
+    <promise>EXPLOIT_COMPLETE</promise>
+  [GATE] exploit_V1.json: impact confirmed ✓
+  [ORCHESTRATOR] Exploit succeeded → skip remaining vectors
 
-[ORCHESTRATOR] Phase 6: Report → ralph_loop(bellum-report, max=3)
-  [RALPH ITER 1]
-    bellum-report: Reading all findings...
-    → Read: findings/target.json, surfaces.json, intel.json, vectors.json, exploit_V1.json
-    → Writing comprehensive pentest report
-    → Wrote reports/bellum-1709913600.md
-    bellum-report: <promise>REPORT_COMPLETE</promise>
-  [RALPH] Gate passed. Exiting loop.
+[ORCHESTRATOR] Phase 6: Report → spawning bellum-report
+  [RALPH bellum-report ITER 1]
+    Reading all findings...
+    → reports/bellum-1709913600.md
+    <promise>REPORT_COMPLETE</promise>
 
 [ORCHESTRATOR] ENGAGEMENT COMPLETE
-  → Report: reports/bellum-1709913600.md
-  → CRITICAL: Unauthenticated BLE command injection → full movement control
-  → Total iterations: 7 (across 5 ralph loops)
-  → Total subagent tasks: 9
-  → Duration: 4m 32s
+  Report: reports/bellum-1709913600.md
+  CRITICAL: Unauthenticated BLE command injection → full movement control
+  Ralph loop iterations: 5 (across 5 phases)
+  Subagent tasks spawned: 11
+  Total time: 3m 47s
+  Human interactions: 0 (yolo mode)
 ```
 
 ---
 
-## File Layout (What We Ship)
+## File Layout
 
 ```
-bellum/                              # forked from opencode
-├── packages/opencode/               # OpenCode source (forked)
-│   └── src/bellum/                  # OUR ADDITIONS
-│       ├── orchestrator.ts
-│       ├── ralph.ts
-│       ├── state.ts
-│       ├── gates.ts
-│       └── prompts/
-├── scripts/                         # Python tools (called via Bash)
+bellum/                                    # forked from opencode
+├── packages/opencode/                     # OpenCode source (forked, MIT)
+│   └── src/bellum/                        # OUR ADDITIONS
+│       ├── orchestrator.ts                # ~80 LOC: phase sequencing
+│       ├── ralph.ts                       # ~60 LOC: ralph loop implementation
+│       ├── gates.ts                       # ~40 LOC: backpressure validators
+│       ├── util.ts                        # ~30 LOC: helpers
+│       └── cli.ts                         # ~20 LOC: `bellum` CLI entry point
+│                                          # TOTAL: ~230 LOC TypeScript
+├── scripts/                               # Python tools (called via Bash)
 │   ├── hardware/
-│   │   ├── ble_scan.py
-│   │   ├── ble_enumerate.py
-│   │   ├── ble_write.py
-│   │   ├── subghz_scan.py
-│   │   ├── subghz_replay.py
-│   │   └── ...
+│   │   ├── ble_scan.py                    # Bleak scan → JSON
+│   │   ├── ble_enumerate.py               # Bleak GATT enum → JSON
+│   │   ├── ble_read.py                    # Bleak read char → JSON
+│   │   ├── ble_write.py                   # Bleak write char (the exploit tool)
+│   │   ├── ble_subscribe.py               # Bleak notifications → JSON stream
+│   │   ├── subghz_scan.py                 # pyFlipper Sub-GHz scan → JSON
+│   │   ├── subghz_capture.py              # pyFlipper capture → .sub file
+│   │   ├── subghz_replay.py               # pyFlipper replay .sub file
+│   │   ├── ir_capture.py                  # pyFlipper IR capture → JSON
+│   │   ├── ir_replay.py                   # pyFlipper IR replay
+│   │   ├── wifi_scan.py                   # scapy/iwlist → JSON
+│   │   └── flipper_serial.py              # pyFlipper generic serial interface
 │   ├── recon/
-│   │   ├── cve_search.py
-│   │   ├── shodan_search.py
-│   │   ├── github_search.py
-│   │   └── fcc_lookup.py
+│   │   ├── cve_search.py                  # NVD API → JSON
+│   │   ├── shodan_search.py               # Shodan API → JSON
+│   │   ├── github_search.py               # GitHub API → JSON
+│   │   └── fcc_lookup.py                  # FCC API → JSON
 │   └── util/
-│       ├── packet_analyze.py
-│       └── firmware_analyze.py
+│       ├── packet_analyze.py              # pyshark → JSON summary
+│       └── firmware_analyze.py            # binwalk → JSON summary
 ├── .opencode/
-│   ├── skills/                      # Attack workflow instructions
+│   ├── agents/                            # Phase agent definitions
+│   │   ├── bellum-recon.md
+│   │   ├── bellum-research.md
+│   │   ├── bellum-enumerate.md
+│   │   ├── bellum-exploit.md
+│   │   └── bellum-report.md
+│   ├── skills/                            # Attack workflow instructions
 │   │   ├── ble-recon/SKILL.md
 │   │   ├── ble-exploit/SKILL.md
 │   │   ├── rf-replay/SKILL.md
-│   │   └── ...
-│   ├── plugins/                     # Hooks (HITL, recovery, audit)
-│   │   ├── hitl-gate.ts
-│   │   ├── hardware-recovery.ts
-│   │   └── audit-log.ts
-│   └── opencode.json               # MCP servers, model config
-├── findings/                        # Runtime output (gitignored)
-├── checkpoints/                     # Crash recovery (gitignored)
-├── reports/                         # Generated reports
-└── requirements.txt                 # Python deps (bleak, pyflipper, scapy, etc.)
+│   │   ├── network-recon/SKILL.md
+│   │   └── osint/SKILL.md
+│   ├── plugins/                           # Runtime hooks
+│   │   ├── exploit-gate.ts                # Optional HITL for exploit tools
+│   │   ├── hardware-recovery.ts           # Auto-reconnect on hardware failures
+│   │   ├── stuck-detection.ts             # Catch repeated identical tool calls
+│   │   └── audit-log.ts                   # Log every tool call for report
+│   └── opencode.json                      # Permissions (yolo), MCP servers
+├── findings/                              # Runtime output (gitignored)
+│   ├── target.json
+│   ├── surfaces.json
+│   ├── intel.json
+│   ├── vectors.json
+│   ├── exploit_V1.json
+│   ├── hardware_status.json
+│   └── audit_log.jsonl
+├── reports/                               # Generated pentest reports
+└── requirements.txt                       # Python: bleak, pyflipper, scapy, shodan, etc.
 ```
+
+---
+
+## Summary: What Makes v3 Different
+
+| Aspect | v1 | v2 | v3 |
+|--------|-----|-----|-----|
+| **State management** | LLM (fragile) | Orchestrator + ralph loops | Orchestrator + ralph loops |
+| **HITL** | Everywhere | Exploit phase only | **Yolo default, optional HITL** |
+| **Subagents** | Not specified | Mentioned | **Full spawn tree with tool access** |
+| **Agent definitions** | Vague | Described | **Complete .md files with prompts** |
+| **Parallelism** | None | Within-phase | **Concrete: 4 parallel recon scans, 3 parallel research tasks** |
+| **Orchestrator** | N/A | Pseudocode | **Real TypeScript, ~230 LOC** |
+| **Tool architecture** | Custom OpenCode tools | Python via Bash | **Python via Bash + built-in OpenCode tools** |
+| **Recovery** | State in FSM | Plugin hooks | **Plugin hooks with concrete implementations** |
+| **Context strategy** | Compression rules | Ralph loops | **Ralph loops + JSON-only script output** |
+| **Demo readiness** | Theoretical | Plausible | **`bellum "prompt"` → autonomous attack → report** |
