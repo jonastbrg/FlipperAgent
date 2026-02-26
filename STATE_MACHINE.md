@@ -1,70 +1,134 @@
-# Bellum Agent State Machine v3
+# Bellum Agent State Machine v3.1
 
-**Version:** 3.0
+**Version:** 3.1
 **Date:** 2026-02-26
 **Architecture:** OpenCode fork + Ralph Wiggum loops + subagent orchestration + yolo mode
 
 ---
 
-## What Changed from v2
+## What Changed from v3
 
-v2 had HITL gates everywhere and treated subagents as an afterthought. v3 flips both:
+v3 assumed OpenCode's subagent system works as documented. It doesn't. Deep research revealed three critical bugs that our fork MUST fix:
 
-| v2 | v3 |
-|----|-----|
-| HITL gates on all exploit tools | **Yolo mode by default.** Optional HITL for exploits only, toggled via env var. |
-| Subagents mentioned but vague | **Concrete subagent spawn tree.** Every phase shows exactly which subagents run, in parallel or series, with what tools. |
-| Sequential ralph loops | **Subagents ARE the ralph loops.** The orchestrator spawns phase agents as subagents. Each is a ralph loop. |
-| LLM-managed pivot logic | **Orchestrator-managed pivot.** Deterministic for loop over vectors. |
+| Bug | Impact | OpenCode Issue | Our Fork Fix |
+|-----|--------|----------------|--------------|
+| **Subagents don't inherit parent permissions** | Subagents block indefinitely on permission prompts in unattended mode. Yolo on parent ≠ yolo on child. | [#12566](https://github.com/anomalyco/opencode/issues/12566) | Propagate parent `permission` config to child session in `task.ts` |
+| **Subagents can't spawn subagents** | `task: false` hardcoded for all subagent sessions. Kills nested delegation. | [#7296](https://github.com/anomalyco/opencode/issues/7296) | Make `task` permission configurable per-agent. Add `task_depth` limit (default 2). |
+| **No async task dispatch** | All subagents are synchronous/blocking. No fire-and-forget. | [#15069](https://github.com/anomalyco/opencode/issues/15069) | Add `Task.dispatch()` with async polling. (Stretch goal — sequential works for hackathon.) |
+
+v3.1 also corrects the yolo mode configuration (v3 used wrong config keys).
 
 ---
 
-## Yolo Mode
+## Yolo Mode (How It Actually Works)
 
-**Default: fully autonomous.** No approval prompts. The agent blasts through recon → research → enum → exploit → report without stopping.
+Three layers, all needed for true autonomous operation:
 
-**Config (`opencode.json`):**
+### Layer 1: Non-Interactive Mode (`-p` flag)
+
+```bash
+# This is the real yolo — -p mode auto-approves ALL permissions
+opencode -p "Attack that quadruped robot"
+```
+
+In `-p` (non-interactive) mode, **all permissions are auto-approved for the entire session**, including subagents. No user prompt ever appears. This is the closest equivalent to Claude Code's `--dangerously-skip-permissions`.
+
+### Layer 2: Config-Based Permission Bypass
+
 ```json
+// opencode.json — global allow-all
 {
-    "permissions": {
-        "allow": [
-            "Bash(*)", "Read(*)", "Write(*)", "Edit(*)",
-            "Glob(*)", "Grep(*)", "WebSearch(*)", "WebFetch(*)",
-            "Task(*)", "TodoWrite(*)"
-        ]
+    "$schema": "https://opencode.ai/config.json",
+    "permission": {
+        "*": "allow"
     }
 }
 ```
 
-**Selective HITL (optional, for safety-conscious runs):**
-```typescript
-// .opencode/plugins/exploit-gate.ts
-export default {
-    name: "exploit-gate",
-    hooks: {
-        "permission.ask": async (ctx) => {
-            const dangerous = ["ble_write", "subghz_replay", "ir_replay", "badusb"];
-            const cmd = ctx.tool?.input?.command || "";
-            if (process.env.BELLUM_HITL === "true" &&
-                dangerous.some(d => cmd.includes(d))) {
-                return { action: "ask" };
-            }
-            return { action: "allow" };
+Granular version — allow everything but block truly dangerous patterns:
+```json
+{
+    "permission": {
+        "*": "allow",
+        "bash": {
+            "*": "allow",
+            "rm -rf /": "deny",
+            "dd if=*": "deny"
         }
     }
-};
+}
 ```
 
-**Running:**
+### Layer 3: Plugin-Based Auto-Approve
+
+```typescript
+// .opencode/plugins/yolo.ts
+import type { Plugin } from "@opencode-ai/plugin"
+
+export const YoloPlugin: Plugin = async (ctx) => {
+    return {
+        'permission.ask': async (permission, output) => {
+            // Auto-approve everything
+            output.status = 'allow'
+        },
+    }
+}
+```
+
+Selective version — yolo for everything except exploit execution:
+```typescript
+// .opencode/plugins/exploit-gate.ts
+export const ExploitGate: Plugin = async (ctx) => {
+    return {
+        'permission.ask': async (permission, output) => {
+            if (process.env.BELLUM_HITL === "true") {
+                const cmd = String(permission.meta?.command || "");
+                const dangerous = ["ble_write", "subghz_replay", "ir_replay", "badusb"];
+                if (dangerous.some(d => cmd.includes(d))) {
+                    return; // fall through to normal prompt
+                }
+            }
+            output.status = 'allow';
+        },
+    }
+}
+```
+
+### Running Bellum
+
 ```bash
-# Full yolo — zero interaction, full autonomous attack chain
-bellum "Attack that quadruped robot"
+# Full yolo — -p mode auto-approves everything, including subagents
+opencode -p "Attack that quadruped robot on table 3"
 
-# Autonomous everything, pause only before sending payloads to hardware
+# With our CLI wrapper (calls opencode -p under the hood):
+bellum "Attack that quadruped robot on table 3"
+
+# Yolo everything except exploit execution (prompts before sending payloads):
 BELLUM_HITL=true bellum "Attack that quadruped robot"
+
+# Restrict available tools:
+bellum "Attack that quadruped" --excludedTools=badusb
 ```
 
-Subagents **inherit parent permissions**, so yolo propagates to every subagent in the tree.
+### Permission Inheritance Fix (Our Fork)
+
+Upstream bug: child sessions in `task.ts` (lines ~72-101) only get hardcoded deny rules. They never inherit parent permission config.
+
+**Our fix in the fork:**
+```typescript
+// packages/opencode/src/session/task.ts — our modification
+const childSession = await createSession({
+    agent: subagentName,
+    parent: parentSession.id,
+    // FIX: propagate parent permission config to child
+    permission: parentSession.agent.permission ?? parentSession.config.permission,
+    // FIX: allow nested task delegation (with depth limit)
+    taskEnabled: (parentSession.taskDepth ?? 0) < MAX_TASK_DEPTH,
+    taskDepth: (parentSession.taskDepth ?? 0) + 1,
+});
+```
+
+This is a ~10 line change in the fork. Without it, subagents in yolo mode block forever.
 
 ---
 
@@ -105,123 +169,187 @@ The orchestrator is **~100 lines of deterministic TypeScript**. It has no LLM ca
 
 ## Subagent Spawn Tree
 
-This is the complete hierarchy. Every box is a separate agent with its own context window.
+### OpenCode Subagent Reality Check
+
+Before the spawn tree, the constraints we're working with (discovered via deep research on upstream issues):
+
+| Constraint | Upstream Issue | Impact | Our Fix |
+|------------|----------------|--------|---------|
+| **Subagents don't inherit permissions** | [#12566](https://github.com/anomalyco/opencode/issues/12566) | Subagents block on permission prompts forever in unattended mode | `opencode -p` auto-approves all + global `"*": "allow"` config (belt and suspenders) |
+| **Subagents can't spawn subagents** | [#7296](https://github.com/anomalyco/opencode/issues/7296) | `task: false` hardcoded in `task.ts`. No nested delegation. | Fork fix: make `task` configurable per-agent with `task_depth` limit. |
+| **Plan mode bypassed by subagents** | [#6527](https://github.com/anomalyco/opencode/issues/6527) | Subagents run with full permissions even if parent is restricted. Actually helps us — but indicates permission model is buggy. | Aware of it, leverage it. |
+| **No async task dispatch** | [#15069](https://github.com/anomalyco/opencode/issues/15069) | All Task calls synchronous. Parallel = multiple Tasks in one LLM message. | Fine for hackathon. Fork fix later. |
+
+**Critical architecture decision: each phase agent runs as a top-level `opencode -p` invocation, NOT as a nested subagent.** The orchestrator is a shell script / TS process that calls `opencode -p` for each phase. This sidesteps all three bugs:
+
+1. `-p` mode auto-approves permissions (no inheritance needed)
+2. Each phase agent is depth 0, its Task subagents are depth 1 (no depth-2 nesting needed)
+3. Parallel tasks within a phase work natively (multiple Task calls in one message)
+
+**Fork fix still needed for:** making depth-1 subagents respect the global `"*": "allow"` config. Without this, Task subagents spawned by the phase agent may still prompt. Belt-and-suspenders: the `permission.ask` plugin also auto-approves.
+
+### The Complete Hierarchy
+
+Every box is a separate agent with its own context window.
 
 ```
-ORCHESTRATOR (TypeScript, no LLM)
+ORCHESTRATOR (TypeScript process, no LLM — calls opencode -p for each phase)
 │
-├── bellum-recon (ralph loop, yolo, fast model)
+│   Each phase = a fresh `opencode -p` invocation (depth 0, auto-approved).
+│   Within each phase, the LLM can spawn Task subagents (depth 1).
+│   This avoids all three upstream subagent bugs.
+│
+├─── opencode -p --agent bellum-recon [prompt]          ← DEPTH 0 (fresh process)
 │   │
-│   │   The recon agent's job: discover attack surfaces.
-│   │   It reads findings/target.json, runs scans, writes findings/surfaces.json.
+│   │   bellum-recon: fast model (kimi/k2.5), yolo, has Task tool
+│   │   Reads findings/target.json → scans → writes findings/surfaces.json
 │   │
-│   ├── Task("BLE scan for 15 seconds")          ─── parallel ───┐
-│   │   └── Bash: python3 scripts/hardware/ble_scan.py --dur 15  │
-│   │                                                              │
-│   ├── Task("nmap service scan 192.168.0.0/24")  ─── parallel ──┤
-│   │   └── Bash: nmap -sV -T4 192.168.0.0/24 -oJ /tmp/nmap.json│
-│   │                                                              │
-│   ├── Task("SubGHz scan 300-900MHz for 20s")     ─── parallel ──┤
-│   │   └── Bash: python3 scripts/hardware/subghz_scan.py         │
-│   │                                                              │
-│   └── Task("WiFi scan nearby networks")          ─── parallel ──┘
+│   │   LLM fires 4 Task calls in ONE message → parallel execution:
+│   │
+│   ├── Task("BLE scan 15s")                            ← DEPTH 1 (subagent)
+│   │   └── Bash: python3 scripts/hardware/ble_scan.py --duration 15
+│   │       → returns: '{"devices": [{"name":"QUADRUPED-XX","mac":"AA:BB:...","rssi":-42}]}'
+│   │
+│   ├── Task("nmap service scan 192.168.4.0/24")        ← DEPTH 1 (parallel)
+│   │   └── Bash: nmap -sV -T4 192.168.4.0/24 -oJ /tmp/nmap.json && cat /tmp/nmap.json
+│   │       → returns: '{"hosts": [{"ip":"192.168.4.1","ports":[22,8080,9090]}]}'
+│   │
+│   ├── Task("SubGHz scan 300-900MHz for 20s")          ← DEPTH 1 (parallel)
+│   │   └── Bash: python3 scripts/hardware/subghz_scan.py --range 300-900 --dur 20
+│   │       → returns: '{"signals": []}'
+│   │
+│   └── Task("WiFi scan nearby networks")               ← DEPTH 1 (parallel)
 │       └── Bash: python3 scripts/hardware/wifi_scan.py
+│           → returns: '{"networks": [{"ssid":"RobotAP-5G","bssid":"..."}]}'
 │
-│   All 4 return results → recon agent merges → writes surfaces.json
-│   Ralph loop checks: does surfaces.json have >= 1 surface?
-│   YES → exit loop, return to orchestrator
-│   NO  → re-iterate (try different scan params, longer duration, etc.)
+│   bellum-recon merges 4 results → Write: findings/surfaces.json
+│   <promise>RECON_COMPLETE</promise>
+│   Ralph loop: gate passed? → yes (3 surfaces). Process exits.
 │
-├── bellum-research (ralph loop, yolo, strong reasoning model)
+│   [ORCHESTRATOR reads findings/surfaces.json, validates gate]
+│
+├─── opencode -p --agent bellum-research [prompt]       ← DEPTH 0 (fresh process)
 │   │
-│   │   The research agent's job: OSINT enrichment.
-│   │   It reads surfaces.json, researches each surface, writes intel.json.
+│   │   bellum-research: strong model (claude-sonnet), yolo, has Task + WebSearch
+│   │   Reads surfaces.json → researches → writes findings/intel.json
 │   │
-│   ├── Task("Research BLE surface: QUADRUPED-XX")  ─── parallel ──┐
-│   │   ├── WebSearch: "QUADRUPED robot BLE vulnerability 2025"     │
-│   │   ├── WebFetch: (CVE detail page)                             │
-│   │   ├── Bash: python3 scripts/recon/github_search.py "QUADRUPED BLE exploit"
-│   │   └── Bash: python3 scripts/recon/cve_search.py "QUADRUPED"  │
-│   │                                                                │
-│   ├── Task("Research HTTP surface: 192.168.4.1:8080") ── parallel ┤
-│   │   ├── WebSearch: "QUADRUPED robot web API documentation"       │
-│   │   ├── Bash: python3 scripts/recon/shodan_search.py "QUADRUPED"│
-│   │   └── WebFetch: (API docs page)                               │
-│   │                                                                │
-│   └── Task("Research SSH surface: 192.168.4.1:22")  ─── parallel ─┘
-│       ├── WebSearch: "QUADRUPED robot default SSH credentials"
+│   │   LLM fires 1 Task per surface → parallel research:
+│   │
+│   ├── Task("Research BLE:QUADRUPED-XX")               ← DEPTH 1
+│   │   ├── WebSearch: "QUADRUPED robot BLE vulnerability 2025 2026"
+│   │   ├── WebFetch: (CVE detail page)
+│   │   ├── Bash: python3 scripts/recon/cve_search.py "QUADRUPED"
+│   │   └── Bash: python3 scripts/recon/github_search.py "QUADRUPED BLE exploit"
+│   │       → returns: "CVE-2025-XXXXX found. Existing Bleak PoC on GitHub. No BLE auth."
+│   │
+│   ├── Task("Research HTTP:192.168.4.1:8080")          ← DEPTH 1 (parallel)
+│   │   ├── WebSearch: "QUADRUPED robot web API"
+│   │   ├── Bash: python3 scripts/recon/shodan_search.py "QUADRUPED"
+│   │   └── WebFetch: (API docs)
+│   │       → returns: "REST API with /api/cmd endpoint. No authentication."
+│   │
+│   └── Task("Research SSH:192.168.4.1:22")             ← DEPTH 1 (parallel)
+│       ├── WebSearch: "QUADRUPED default SSH credentials"
 │       └── Bash: python3 scripts/recon/cve_search.py "OpenSSH 8.9"
+│           → returns: "Default creds admin:admin common for this brand."
 │
-│   All 3 return intel → research agent merges → writes intel.json
-│   Ralph loop checks: does intel.json have >= 1 hypothesis?
-│   YES → exit loop
-│   NO  → re-iterate (broader search terms, different databases)
+│   bellum-research merges → Write: findings/intel.json (3 hypotheses)
+│   <promise>RESEARCH_COMPLETE</promise>
 │
-├── bellum-enumerate (ralph loop, yolo, strong model)
+│   [ORCHESTRATOR reads findings/intel.json, validates gate]
+│
+├─── opencode -p --agent bellum-enumerate [prompt]      ← DEPTH 0 (fresh process)
 │   │
-│   │   The enumeration agent's job: confirm hypotheses, extract attack params.
-│   │   It reads surfaces.json + intel.json, probes target, writes vectors.json.
+│   │   bellum-enumerate: strong model, yolo, NO Task tool (sequential only)
+│   │   Reads surfaces.json + intel.json → probes target → writes findings/vectors.json
 │   │
-│   │   (Runs hypotheses in priority order, NOT parallel — interacting with
-│   │    the same target device simultaneously could cause BLE conflicts)
+│   │   SEQUENTIAL — avoid BLE connection conflicts from parallel access
 │   │
 │   ├── Hypothesis H1: BLE GATT write
 │   │   ├── Bash: python3 scripts/hardware/ble_enumerate.py AA:BB:CC:DD:EE:FF
 │   │   ├── Bash: python3 scripts/hardware/ble_read.py AA:BB:CC:DD:EE:FF 0xFFE1
-│   │   └── Result: CONFIRMED — char 0xFFE1 writable, no auth
+│   │   └── → CONFIRMED: 0xFFE1 writable, no auth, little-endian, byte[0]=cmd byte[1-2]=params
 │   │
-│   ├── Hypothesis H3: REST API injection
-│   │   ├── Bash: curl -s http://192.168.4.1:8080/api/ | python3 -m json.tool
-│   │   ├── Bash: curl -s http://192.168.4.1:8080/api/status
-│   │   └── Result: CONFIRMED — /api/cmd accepts POST, no auth
+│   ├── Hypothesis H3: REST API
+│   │   ├── Bash: curl -s http://192.168.4.1:8080/api/
+│   │   ├── Bash: curl -s -X POST http://192.168.4.1:8080/api/cmd -H 'Content-Type: application/json' -d '{"action":"status"}'
+│   │   └── → CONFIRMED: /api/cmd accepts POST, JSON body, no auth
 │   │
-│   └── writes vectors.json with confirmed vectors, ranked
+│   └── Write: findings/vectors.json  (V1: BLE write [CRITICAL], V2: REST API [CRITICAL])
+│   <promise>ENUM_COMPLETE</promise>
 │
-│   Ralph loop checks: does vectors.json have >= 1 confirmed vector?
-│   YES → exit loop
-│   NO  → re-iterate (try different enumeration approaches)
+│   [ORCHESTRATOR reads findings/vectors.json, validates gate, enters pivot loop]
 │
-├── FOR vector IN vectors.json:    ← deterministic pivot loop (orchestrator code)
+├─── FOR vector IN vectors.vector_priority:             ← DETERMINISTIC (orchestrator TS)
 │   │
-│   └── bellum-exploit (ralph loop, yolo or HITL, strongest model)
+│   └── opencode -p --agent bellum-exploit [prompt]     ← DEPTH 0 (fresh process)
 │       │
-│       │   The exploit agent's job: craft and execute PoC.
-│       │   It reads vectors.json + intel.json, develops exploit, executes it.
+│       │   bellum-exploit: strongest model (claude-sonnet), yolo (or HITL via plugin)
+│       │   Reads vectors.json + intel.json → crafts + executes exploit
 │       │
-│       │   Iteration 1:
-│       ├── WebSearch: "BLE GATT write movement command Bleak example"
-│       ├── Bash: python3 -c "# craft payload based on research..."
+│       ├── WebSearch: "BLE GATT write Bleak movement command example python"
+│       ├── Read: findings/intel.json (protocol details)
+│       ├── Bash: python3 -c "payload = bytes([0x01, 0x02, 0x00, 0x32]); print(payload.hex())"
 │       ├── Bash: python3 scripts/hardware/ble_write.py AA:BB:CC:DD:EE:FF 0xFFE1 01020032
-│       │         ↑ If BELLUM_HITL=true, plugin intercepts and prompts user
-│       │         ↑ If BELLUM_HITL=false (default), auto-approved, fires immediately
-│       ├── Result: robot moves → SUCCESS
-│       └── writes findings/exploit_V1.json
+│       │         ↑ YOLO: -p mode auto-approves. Fires immediately.
+│       │         ↑ (If BELLUM_HITL=true: permission.ask plugin intercepts, prompts user)
+│       ├── → Robot moves forward!
+│       ├── Bash: python3 scripts/hardware/ble_write.py AA:BB:CC:DD:EE:FF 0xFFE1 00000000
+│       ├── → Robot stops!
+│       └── Write: findings/exploit_V1.json { "success": true, "impact": "full movement control" }
+│       <promise>EXPLOIT_COMPLETE</promise>
 │
-│       Ralph loop checks: does exploit_V1.json have non-null "impact"?
-│       YES → exit loop, return success to orchestrator
-│       NO  → re-iterate (different payload, different approach)
-│       Max iterations exhausted → return failure, orchestrator tries next vector
+│   ORCHESTRATOR reads findings/exploit_V1.json:
+│     success === true? → break out of for loop ✓
+│     success === false? → continue to next vector (V2: REST API)
+│     all vectors failed? → proceed to report anyway
 │
-│   Orchestrator: exploit succeeded? → break out of for loop
-│   Orchestrator: exploit failed? → continue to next vector (PIVOT)
-│   Orchestrator: all vectors failed? → proceed to report anyway
-│
-└── bellum-report (ralph loop, yolo, fast model)
+└─── opencode -p --agent bellum-report [prompt]         ← DEPTH 0 (fresh process)
     │
-    │   The report agent's job: generate pentest report.
-    │   It reads ALL files in findings/, writes reports/bellum-{id}.md.
+    │   bellum-report: fast model (kimi/k2.5), yolo, read-only (no Bash, no hardware)
+    │   Reads ALL findings/* → writes reports/bellum-{id}.md
     │
+    ├── Glob: findings/*.json
     ├── Read: findings/target.json
     ├── Read: findings/surfaces.json
     ├── Read: findings/intel.json
     ├── Read: findings/vectors.json
-    ├── Read: findings/exploit_V1.json (and any others)
-    └── Write: reports/bellum-{engagement_id}.md
+    ├── Read: findings/exploit_V1.json
+    └── Write: reports/bellum-1709913600.md
 
-    Ralph loop checks: does report file exist AND have all required sections?
-    YES → exit loop
-    NO  → re-iterate
+    <promise>REPORT_COMPLETE</promise>
 ```
+
+### Why This Architecture Avoids All Upstream Bugs
+
+| Bug | Why It Doesn't Affect Us |
+|-----|--------------------------|
+| **Permission inheritance** ([#12566](https://github.com/anomalyco/opencode/issues/12566)) | Each phase is `opencode -p` (auto-approves everything). Plus global `"*": "allow"` config as belt-and-suspenders. |
+| **No nested task delegation** ([#7296](https://github.com/anomalyco/opencode/issues/7296)) | Phase agents are depth 0. Their Task subagents are depth 1. No depth 2 needed. |
+| **Plan mode bypass** ([#6527](https://github.com/anomalyco/opencode/issues/6527)) | We don't use Plan mode. All agents are in build/execution mode. |
+| **No async tasks** ([#15069](https://github.com/anomalyco/opencode/issues/15069)) | Parallel = multiple Task calls in one LLM message (works today). Phase-to-phase is sequential (fine for attack chain). |
+
+### Fork Fix Checklist (Minimal)
+
+Even though the architecture avoids most bugs, we still want these fork fixes for robustness:
+
+```typescript
+// packages/opencode/src/session/task.ts — our modifications
+
+// FIX 1: Propagate parent permission config to child session (~5 lines)
+const childSession = await createSession({
+    agent: subagentName,
+    parent: parentSession.id,
+    permission: parentSession.agent.permission ?? globalConfig.permission,
+});
+
+// FIX 2: Make task delegation configurable per agent (~3 lines)
+// In agent frontmatter: `task: true` or `task: false`
+// Default: true for primary agents, false for subagents (unchanged from upstream)
+// Our agents set `task: true` explicitly
+```
+
+Total fork diff: **~8 lines changed in `task.ts`**. Everything else is additive (new files in `src/bellum/`).
 
 ---
 
@@ -431,8 +559,12 @@ When the report is complete, output <promise>REPORT_COMPLETE</promise>
 ```typescript
 // packages/opencode/src/bellum/orchestrator.ts
 
-import { spawnAgent, readJson, writeJson, checkHardware } from "./util";
-import { validateSurfaces, validateIntel, validateVectors, validateExploit, validateReport } from "./gates";
+import { exec } from "child_process";
+import { promisify } from "util";
+import { readJson, writeJson, checkHardware, fileExists } from "./util";
+import { validateSurfaces, validateIntel, validateVectors, validateExploit } from "./gates";
+
+const run = promisify(exec);
 
 interface BellumConfig {
     target: string;
@@ -441,81 +573,128 @@ interface BellumConfig {
     maxEnumIter: number;      // default 10
     maxExploitIter: number;   // default 8
     maxReportIter: number;    // default 3
-    hitl: boolean;            // default false (yolo)
+    hitl: boolean;            // default false (full yolo)
+}
+
+// Each phase = a separate `opencode -p` process invocation.
+// -p mode auto-approves all permissions (yolo).
+// The ralph loop is implemented by re-invoking until gate passes or max iterations hit.
+async function runPhase(opts: {
+    agent: string;
+    prompt: string;
+    gate: () => boolean;
+    maxIter: number;
+    env?: Record<string, string>;
+}): Promise<boolean> {
+    for (let i = 0; i < opts.maxIter; i++) {
+        const envStr = Object.entries(opts.env ?? {})
+            .map(([k, v]) => `${k}=${JSON.stringify(v)}`).join(" ");
+
+        // Each iteration is a fresh opencode -p invocation.
+        // The agent reads its previous work from findings/*.json files.
+        await run(
+            `${envStr} opencode -p ${JSON.stringify(opts.prompt)} --agent ${opts.agent} -q`,
+            { timeout: 300_000 } // 5 min timeout per iteration
+        );
+
+        if (opts.gate()) return true; // phase complete
+        // else: re-iterate — agent will read its own output from disk next time
+    }
+    return false; // max iterations exhausted, gate never passed
 }
 
 export async function runEngagement(config: BellumConfig) {
     const engagementId = `bellum-${Date.now()}`;
 
-    // PHASE 0: Target acquisition (no LLM)
+    // PHASE 0: Target acquisition (no LLM — deterministic hardware check)
     const hardware = await checkHardware();
     await writeJson("findings/target.json", {
         engagement_id: engagementId,
         target: config.target,
         hardware,
-        available_tools: deriveToolset(hardware),
+        timestamp: new Date().toISOString(),
     });
+    console.log(`[BELLUM] Engagement ${engagementId} started.`);
+    console.log(`[BELLUM] Hardware: ${JSON.stringify(hardware)}`);
 
     // PHASE 1: Recon
-    await spawnAgent({
+    console.log("[BELLUM] Phase 1: Reconnaissance");
+    const reconOk = await runPhase({
         agent: "bellum-recon",
-        maxIterations: config.maxReconIter,
-        completionPromise: "RECON_COMPLETE",
+        prompt: `Discover all wireless and network attack surfaces for: ${config.target}. ` +
+                `Hardware available: ${JSON.stringify(hardware)}. ` +
+                `Read findings/target.json. Write results to findings/surfaces.json. ` +
+                `Output <promise>RECON_COMPLETE</promise> when done.`,
+        gate: () => validateSurfaces("findings/surfaces.json"),
+        maxIter: config.maxReconIter,
     });
-    if (!validateSurfaces("findings/surfaces.json")) {
-        return await runReport(engagementId, "No attack surfaces discovered");
-    }
+    if (!reconOk) return await runReport(engagementId, "No attack surfaces discovered");
 
     // PHASE 2: Research
-    await spawnAgent({
+    console.log("[BELLUM] Phase 2: Research");
+    const researchOk = await runPhase({
         agent: "bellum-research",
-        maxIterations: config.maxResearchIter,
-        completionPromise: "RESEARCH_COMPLETE",
+        prompt: `Research vulnerabilities for discovered surfaces. ` +
+                `Read findings/surfaces.json. Write results to findings/intel.json. ` +
+                `Output <promise>RESEARCH_COMPLETE</promise> when done.`,
+        gate: () => validateIntel("findings/intel.json"),
+        maxIter: config.maxResearchIter,
     });
-    if (!validateIntel("findings/intel.json")) {
-        return await runReport(engagementId, "No attack hypotheses formed");
-    }
+    if (!researchOk) return await runReport(engagementId, "No attack hypotheses formed");
 
     // PHASE 3: Enumeration
-    await spawnAgent({
+    console.log("[BELLUM] Phase 3: Enumeration");
+    const enumOk = await runPhase({
         agent: "bellum-enumerate",
-        maxIterations: config.maxEnumIter,
-        completionPromise: "ENUM_COMPLETE",
+        prompt: `Deep-dive attack hypotheses. Confirm or reject each. ` +
+                `Read findings/surfaces.json + findings/intel.json. ` +
+                `Write confirmed vectors to findings/vectors.json. ` +
+                `Output <promise>ENUM_COMPLETE</promise> when done.`,
+        gate: () => validateVectors("findings/vectors.json"),
+        maxIter: config.maxEnumIter,
     });
-    if (!validateVectors("findings/vectors.json")) {
-        return await runReport(engagementId, "No exploitable vectors confirmed");
-    }
+    if (!enumOk) return await runReport(engagementId, "No exploitable vectors confirmed");
 
-    // PHASE 4+5: Exploit + Pivot
+    // PHASE 4+5: Exploit + Pivot (deterministic for loop)
     const vectors = await readJson("findings/vectors.json");
     let exploitSuccess = false;
 
-    for (const vector of vectors.vector_priority) {
-        await spawnAgent({
+    for (const vectorId of vectors.vector_priority) {
+        console.log(`[BELLUM] Phase 4: Exploit → vector ${vectorId}`);
+        const ok = await runPhase({
             agent: "bellum-exploit",
-            maxIterations: config.maxExploitIter,
-            completionPromise: "EXPLOIT_COMPLETE",
-            env: { CURRENT_VECTOR: vector, BELLUM_HITL: String(config.hitl) },
+            prompt: `Exploit vector ${vectorId}. ` +
+                    `Read findings/vectors.json + findings/intel.json. ` +
+                    `Craft and execute PoC. Write to findings/exploit_${vectorId}.json. ` +
+                    `Output <promise>EXPLOIT_COMPLETE</promise> when done.`,
+            gate: () => validateExploit(`findings/exploit_${vectorId}.json`),
+            maxIter: config.maxExploitIter,
+            env: config.hitl ? { BELLUM_HITL: "true" } : {},
         });
-
-        if (validateExploit(`findings/exploit_${vector}.json`)) {
-            exploitSuccess = true;
-            break;  // THE PIVOT: for loop IS the pivot logic
-        }
-        // else: continue to next vector automatically
+        if (ok) { exploitSuccess = true; break; }
+        // else: PIVOT — for loop continues to next vector
+        console.log(`[BELLUM] Vector ${vectorId} failed. Pivoting...`);
     }
 
-    // PHASE 6: Report
-    await runReport(engagementId, exploitSuccess ? "Exploitation successful" : "All vectors attempted");
+    // PHASE 6: Report (always runs)
+    return await runReport(
+        engagementId,
+        exploitSuccess ? "Exploitation successful" : "All vectors attempted"
+    );
 }
 
 async function runReport(engagementId: string, summary: string) {
+    console.log("[BELLUM] Phase 6: Report");
     await writeJson("findings/summary.json", { engagementId, summary });
-    await spawnAgent({
+    await runPhase({
         agent: "bellum-report",
-        maxIterations: 3,
-        completionPromise: "REPORT_COMPLETE",
+        prompt: `Generate pentest report. Read ALL files in findings/. ` +
+                `Write report to reports/bellum-${engagementId}.md. ` +
+                `Output <promise>REPORT_COMPLETE</promise> when done.`,
+        gate: () => fileExists(`reports/bellum-${engagementId}.md`),
+        maxIter: 3,
     });
+    console.log(`[BELLUM] DONE. Report: reports/bellum-${engagementId}.md`);
 }
 ```
 
@@ -847,17 +1026,17 @@ bellum/                                    # forked from opencode
 
 ---
 
-## Summary: What Makes v3 Different
+## Summary: What Makes v3.1 Different
 
-| Aspect | v1 | v2 | v3 |
-|--------|-----|-----|-----|
-| **State management** | LLM (fragile) | Orchestrator + ralph loops | Orchestrator + ralph loops |
-| **HITL** | Everywhere | Exploit phase only | **Yolo default, optional HITL** |
-| **Subagents** | Not specified | Mentioned | **Full spawn tree with tool access** |
-| **Agent definitions** | Vague | Described | **Complete .md files with prompts** |
-| **Parallelism** | None | Within-phase | **Concrete: 4 parallel recon scans, 3 parallel research tasks** |
-| **Orchestrator** | N/A | Pseudocode | **Real TypeScript, ~230 LOC** |
-| **Tool architecture** | Custom OpenCode tools | Python via Bash | **Python via Bash + built-in OpenCode tools** |
-| **Recovery** | State in FSM | Plugin hooks | **Plugin hooks with concrete implementations** |
-| **Context strategy** | Compression rules | Ralph loops | **Ralph loops + JSON-only script output** |
-| **Demo readiness** | Theoretical | Plausible | **`bellum "prompt"` → autonomous attack → report** |
+| Aspect | v1 | v2 | v3 | v3.1 |
+|--------|-----|-----|-----|------|
+| **State management** | LLM (fragile) | Orchestrator + ralph loops | Same | Same |
+| **HITL** | Everywhere | Exploit only | Yolo default | **Yolo via `-p` mode + `"*": "allow"` + plugin** |
+| **Subagents** | Not specified | Mentioned | Full spawn tree | **Grounded in real upstream bugs + workarounds** |
+| **Spawn model** | N/A | N/A | Nested subagents | **`opencode -p` per phase (depth 0) + Task (depth 1)** |
+| **Permission model** | N/A | N/A | Assumed inheritance | **-p auto-approve + global allow + plugin fallback** |
+| **Upstream bugs** | Not considered | Not considered | Not considered | **3 bugs documented, all sidestepped by architecture** |
+| **Fork diff** | N/A | ~200 LOC | ~230 LOC | **~8 lines in task.ts + ~230 LOC additive** |
+| **Parallelism** | None | Within-phase | Concrete | **Multiple Task calls in one message (proven pattern)** |
+| **Orchestrator** | N/A | Pseudocode | Real TS | **Real TS using `opencode -p` process invocations** |
+| **Demo readiness** | Theoretical | Plausible | Demoable | **Tested against real OpenCode constraints** |

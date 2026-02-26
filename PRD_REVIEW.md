@@ -167,14 +167,17 @@ bellum/                                   # forked from opencode
 - **Ralph loops** (from [ralph-wiggum plugin](https://github.com/anthropics/claude-code/blob/main/plugins/ralph-wiggum/README.md)) iterate each phase until completion criteria met. The LLM's previous work persists in files — each iteration sees fresh context + file state.
 - **Backpressure gates** block phase transitions until output validates (e.g., recon must produce >= 1 surface before research can start).
 - **OpenCode's built-in tools** (Bash, WebSearch, WebFetch, Read/Write, Task, TodoWrite) cover half the PRD's tool list for free. Hardware tools are Python scripts called via Bash.
-- **Subagents** (OpenCode's Task tool) enable parallel execution within phases — BLE scan + nmap + SubGHz scan running simultaneously.
+- **Yolo mode** via three layers: `opencode -p` (auto-approves all permissions in non-interactive mode), global `"permission": { "*": "allow" }` in config, and a `permission.ask` plugin hook as fallback. Full autonomous operation with zero user interaction.
+- **Each phase = `opencode -p` invocation** (not nested subagents). Sidesteps three upstream bugs: subagents don't inherit permissions ([#12566](https://github.com/anomalyco/opencode/issues/12566)), can't spawn sub-subagents ([#7296](https://github.com/anomalyco/opencode/issues/7296)), and no async dispatch ([#15069](https://github.com/anomalyco/opencode/issues/15069)).
+- **Parallel execution within phases** via OpenCode's Task tool — phase agent fires multiple Task calls in one message (e.g., 4 parallel recon scans, 3 parallel research tasks). This is proven to work in upstream.
 - **Files are shared memory.** No token context carries between phases. Each phase reads findings from disk, writes updated findings. Infinite effective context.
 
 **Honest trade-offs:**
-- Fork maintenance burden (but additions are isolated in `src/bellum/`, ~200 LOC)
+- Fork maintenance burden (but additions are isolated: ~8 lines changed in `task.ts`, ~230 LOC additive in `src/bellum/`)
 - Bun runtime dependency (one extra install)
 - Python scripts called via Bash (not native OpenCode tools — but simpler, no TS wrappers needed)
 - OpenCode's TUI is coding-oriented (but the agent prompts fully override the behavior)
+- Three upstream subagent bugs require awareness; architecture sidesteps all three, but fork fixes (~8 LOC in `task.ts`) add robustness
 
 ### 3.2 CAI (Cybersecurity AI) — STRONG RUNNER-UP
 
