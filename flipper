@@ -1,0 +1,16 @@
+#!/bin/bash
+# FlipperAgent — Interactive pentest session
+#
+# Usage:
+#   flipper          # OpenCode (default)
+#   flipper claude   # Claude Code
+
+cd "$(dirname "$0")"
+
+if [[ "${1:-}" == "claude" ]]; then
+    shift
+    exec claude "$@"
+else
+    export OPENCODE_DISABLE_CLAUDE_CODE=1
+    exec opencode "$@"
+fi

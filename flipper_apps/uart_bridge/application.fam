@@ -1,0 +1,10 @@
+App(
+    appid="uart_bridge",
+    name="UART Bridge",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="uart_bridge_app",
+    requires=["gui"],
+    stack_size=2 * 1024,
+    order=100,
+    fap_category="GPIO",
+)

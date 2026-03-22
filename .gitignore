@@ -1,0 +1,48 @@
+# Virtual environments
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Private documents
+docs/private/
+*.private.*
+*.draft.*
+*.pptx
+
+# External repos (cloned for reference, not part of this project)
+# Use a catch-all pattern instead of listing specific repo names
+# Any top-level directory that has its own .git is a cloned repo
+**/extern/
+
+# Runtime data (contains device serials, BLE addresses, scan results)
+findings/
+campaigns/
+*-Campaign/
+checkpoints/
+reports/
+logs/
+*.audit.jsonl
+system_prompt.json
+
+# Owlex runtime state
+.owlex/
+
+# Generated config backups
+sdkconfig.old
+
+# Flipper Zero app builds
+flipper_apps/*/build/
+flipper_apps/*/*.fap
+*.ufbt*
+.ufbt/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+engagement_state.json
+progress.txt

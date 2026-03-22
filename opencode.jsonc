@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "xai/grok-4-1",
+  "mcp": {
+    "flipper": {
+      "type": "local",
+      "enabled": true,
+      "timeout": 15000,
+      "command": [
+        "./flipperzero-mcp/.venv/bin/python",
+        "-m", "flipper_mcp.cli.main"
+      ],
+      "environment": {
+        "PYTHONUNBUFFERED": "1",
+        "FLIPPER_TRANSPORT": "usb"
+      }
+    }
+  }
+}
